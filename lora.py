@@ -37,15 +37,15 @@ class LR1121:
     _CMD_SET_RX               = 0x0209  # Start reception
     _CMD_READ_BUFFER          = 0x010A  # Read received payload
     _CMD_GET_RSSI_INST        = 0x0205  # Get instantaneous RSSI
-    CMD_GET_VERSION          = 0x0101  # Command to get version info
-    CMD_GET_RANDOM_NUMBER    = 0x0120
-    CMD_MODE_STANDBY = 0x011C00
-    DEVICE_LR1121 = 0x03
+    _CMD_GET_VERSION          = 0x0101  # Command to get version info
+    _CMD_GET_RANDOM_NUMBER    = 0x0120
+    _CMD_MODE_STANDBY = 0x011C00
+    _DEVICE_LR1121 = 0x03
 
     # Packet types
-    PACKET_TYPE_LORA = 0x02
-    BUSY_MAX_DELAY_MS = 300
-    REBOOT_MAX_DELAY_MS = 300
+    _PACKET_TYPE_LORA = 0x02
+    _BUSY_MAX_DELAY_MS = 300
+    _REBOOT_MAX_DELAY_MS = 300
 
     def __init__(self, spi, cs_pin, reset_pin, irq_pin=None, busy_pin=None, tcxo_voltage=0):
         """
@@ -77,6 +77,21 @@ class LR1121:
     def busy_handler(self, busy_pin):
         self.is_busy = busy_pin.value() == 1
         
+    def close(self):
+        """
+        Properly shuts down the LR1121 module by:
+        - Disabling the IRQ pin interrupt.
+        - Deinitializing the SPI interface to free hardware resources.
+        
+        This should be called when the module is no longer needed to prevent 
+        conflicts with other SPI devices or redundant power consumption.
+        """
+        logger.info("Closing LR1121 module.")
+        # Disable IRQ if it was configured
+        self.irq_pin.irq(None)
+        # Deinitialize SPI
+        self.spi.deinit()
+        
     def reset(self):
         """
         Reset the LR1121 module and wait until it is ready.
@@ -87,63 +102,75 @@ class LR1121:
         self.reset_pin.value(1)
         
         logger.debug("Waiting for BUSY signal to go low...")
-        deadline = time.ticks_add(time.ticks_ms(), self.REBOOT_MAX_DELAY_MS)
+        deadline = time.ticks_add(time.ticks_ms(), self._REBOOT_MAX_DELAY_MS)
         while self.is_busy:
             if time.ticks_diff(deadline, time.ticks_ms()) < 0:
                 logger.error("Timeout waiting for BUSY to go low.")
                 raise ValueError("Timeout waiting for BUSY to go low.")
             time.sleep_ms(10)
-        logger.info("BUSY signal is low, reset complete.")
+        logger.debug("BUSY signal is low, reset complete.")
     
-    def spi_command(self, cmd, write, data=None, read_length=0, pre_read_length=0):
+    def spi_command(self, cmd: int, write: bool, data: bytes = b"", read_length: int = 0, pre_read_length: int = 0) -> bytes:
         """
-        Send an SPI command to the LR11x0 device.
-        """
-        if data is not None:
-            cmd_bytes = (cmd + data).to_bytes(3, 'big')
-        else:
-            # Convert the command (a 16-bit number) to 2 bytes in big-endian order.
-            cmd_bytes = cmd.to_bytes(2, 'big')
-        
-        # Send the command (and read preliminary output if required)
-        response = None
-        logger.debug(f"SPIcommand (read): Sending command {cmd_bytes}")
-        self.cs.value(0)  # Pull CS low to start the SPI transaction.
+        Send an SPI command to the LR1121 device.
 
+        The function handles both read and write SPI transactions. 
+        - For write operations, it sends the command and data in a single transaction.
+        - For read operations, it performs a two-step process:
+        1. Sends the command and optionally reads preliminary bytes.
+        2. Waits for BUSY to go low, then reads the expected response.
+
+        :param cmd: 16-bit command to send.
+        :param write: True for a write operation, False for a read operation.
+        :param data: Data bytes to send (default: empty bytes for read commands).
+        :param read_length: Number of bytes to read (for read operations).
+        :param pre_read_length: Number of preliminary bytes to read before actual data read.
+        :return: Received response bytes (for read operations) or an empty bytes object for write operations.
+        """
+        # Construct the command bytes (16-bit for standard, 24-bit if data is appended)
+        cmd_bytes = cmd.to_bytes(2, 'big') + data
+
+        logger.debug(f"Sending command '0x{cmd:04X}' with data: '{data.hex()}'.")
+
+        # Step 1: Send command and optionally read preliminary bytes
+        self.cs.value(0)  # CS Low (begin transaction)
+
+        prelim = None
         if pre_read_length:
-            # Create a temporary buffer to hold the preliminary bytes.
             prelim = bytearray(pre_read_length)
-            # Here we use write_readinto to send the command and receive preliminary bytes.
             self.spi.write_readinto(cmd_bytes, prelim)
-            logger.debug(f"Preliminary output: '{prelim}'.")
+            logger.debug(f"Preliminary output: '{prelim.hex()}'.")
         else:
-            # Just send the command bytes.
             self.spi.write(cmd_bytes)
-        self.cs.value(1)
-        
-        logger.info(f"BUSY pin is '{'HIGH' if self.busy_pin.value() == 1 else 'LOW'}'.")
-    
-        if not write:
-            deadline = time.ticks_add(time.ticks_ms(), self.BUSY_MAX_DELAY_MS)
-            while self.is_busy:
-                if time.ticks_diff(deadline, time.ticks_ms()) < 0:
-                    logger.error("Timeout waiting for BUSY to go low after SPI command.")
-                    raise ValueError("Timeout waiting for BUSY to go low after SPI command.")
-                time.sleep_ms(10)
-                
-            logger.info(f"BUSY pin is '{'HIGH' if self.busy_pin.value() == 1 else 'LOW'}'.")
 
-            self.cs.value(0)
-            # Read the response
-            logger.debug(f"SPIcommand (read): Reading '{read_length}' response bytes.")
-            # The spi.read(n) call will typically send zero‐bytes (or dummy bytes) while reading.
-            response = self.spi.read(read_length)
-            logger.debug(f"SPIcommand (read): Received response: '{response}'.")
-            logger.info(f"BUSY pin is '{'HIGH' if self.busy_pin.value() == 1 else 'LOW'}'.")
-            self.cs.value(1)
-            logger.info(f"BUSY pin is '{'HIGH' if self.busy_pin.value() == 1 else 'LOW'}'.")
-            
+        self.cs.value(1)  # CS High (end transaction)
+        
+        # Log BUSY pin state
+        busy_state = "HIGH" if self.busy_pin.value() == 1 else "LOW"
+        logger.debug(f"BUSY pin after command: '{busy_state}'.")
+
+        if write:
+            return prelim if prelim else b""  # Write operation is complete, return empty bytes
+
+        # Step 2: Wait for BUSY to go LOW before reading the response
+        deadline = time.ticks_add(time.ticks_ms(), self._BUSY_MAX_DELAY_MS)
+        while self.busy_pin.value() == 1:
+            if time.ticks_diff(deadline, time.ticks_ms()) < 0:
+                logger.error("Timeout waiting for BUSY to go low after SPI command.")
+                raise TimeoutError("Timeout waiting for BUSY to go low after SPI command.")
+            time.sleep_ms(10)
+
+        logger.debug("BUSY pin is LOW, proceeding with read.")
+
+        # Step 3: Read the response
+        self.cs.value(0)  # CS Low again for reading response
+        response = self.spi.read(read_length)
+        self.cs.value(1)  # CS High (end transaction)
+
+        logger.debug(f"Received response: '{response.hex()}'.")
+
         return response
+
 
     def begin(self, frequency, bandwidth, spreading_factor, coding_rate,
               preamble_length=8, sync_word=0x34):
@@ -325,8 +352,8 @@ class LR1121:
 
         :return: A tuple (hardware, device, fw_major, fw_minor) if successful, or None if no valid response.
         """
-        logger.info("Querying version info...")
-        response = self.spi_command(self.CMD_GET_VERSION, False, None, 5, 2)                
+        logger.info("Querying version info.")
+        response = self.spi_command(self._CMD_GET_VERSION, False, b"", 5, 2)                
         if response is None or len(response) < 5:
             logger.error("No valid version response received.")
             return None
@@ -337,10 +364,10 @@ class LR1121:
         fw_major = response[3]
         fw_minor = response[4]
         
-        logger.debug(f"GetVersion command status: '{stat1}'")
-        logger.debug(f"Hardware version: '{hw_version}'")
-        logger.debug(f"Device: '{device}'")
-        logger.debug(f"Firmware: '{fw_major}.{fw_minor}'")
+        logger.debug(f"GetVersion command status: '{stat1}'.")
+        logger.info(f"Hardware version: '{hw_version}'.")
+        logger.info(f"Device: '{device}'.")
+        logger.info(f"Firmware: '{fw_major}.{fw_minor}'.")
         
         return (stat1, hw_version, device, fw_major, fw_minor)
     
@@ -356,9 +383,9 @@ class LR1121:
 
         :return: A 32-bit unsigned integer with the random number, or None if the response is invalid.
         """
-        logger.info("Requesting random number...")
+        logger.info("Requesting random number.")
         # Send command 0x0120 with no extra data and expect 5 bytes in response.
-        response = self.spi_command(self.CMD_GET_RANDOM_NUMBER, False, None, 5, 2)
+        response = self.spi_command(self._CMD_GET_RANDOM_NUMBER, False, b"", 5, 2)
         if response is None or len(response) < 5:
             logger.error("Invalid random number response.")
             return None
@@ -368,7 +395,7 @@ class LR1121:
         
         # The following 4 bytes are the random number.
         rand_bytes = response[1:5]
-        rand_val = int.from_bytes(rand_bytes, 'big', True)
+        rand_val = int.from_bytes(rand_bytes, 'big')
         logger.info(f"Random number: '{rand_val}'.")
         return rand_val
 
@@ -416,6 +443,5 @@ if __name__ == "__main__":
     # if rssi is not None:
     #     logger.info("Current RSSI: %.2f dBm", rssi)
         
-    #lr.get_random_number()
-    lr.irq_pin.irq(None)
-    spi.deinit()
+    lr.get_random_number()
+    lr.close()
