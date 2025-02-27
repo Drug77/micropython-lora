@@ -39,7 +39,7 @@ class LR1121:
     _CMD_GET_RSSI_INST        = 0x0205  # Get instantaneous RSSI
     _CMD_GET_VERSION          = 0x0101  # Command to get version info
     _CMD_GET_RANDOM_NUMBER    = 0x0120
-    _CMD_MODE_STANDBY = 0x011C00
+    _CMD_MODE_STANDBY = 0x011C
     _DEVICE_LR1121 = 0x03
 
     # Packet types
@@ -130,7 +130,10 @@ class LR1121:
         # Construct the command bytes (16-bit for standard, 24-bit if data is appended)
         cmd_bytes = cmd.to_bytes(2, 'big') + data
 
-        logger.debug(f"Sending command '0x{cmd:04X}' with data: '{data.hex()}'.")
+        if data:
+            logger.debug(f"Sending command '%s' with data: '%s'.", f"0x{cmd:04X}", " ".join(f"0x{b:02X}" for b in data))
+        else:
+            logger.debug(f"Sending command '0x{cmd:04X}'.")
 
         # Step 1: Send command and optionally read preliminary bytes
         self.cs.value(0)  # CS Low (begin transaction)
@@ -139,7 +142,7 @@ class LR1121:
         if pre_read_length:
             prelim = bytearray(pre_read_length)
             self.spi.write_readinto(cmd_bytes, prelim)
-            logger.debug(f"Preliminary output: '{prelim.hex()}'.")
+            logger.debug("Preliminary response: '%s'.", " ".join(f"0x{b:02X}" for b in prelim))
         else:
             self.spi.write(cmd_bytes)
 
@@ -167,10 +170,44 @@ class LR1121:
         response = self.spi.read(read_length)
         self.cs.value(1)  # CS High (end transaction)
 
-        logger.debug(f"Received response: '{response.hex()}'.")
-
+        logger.debug("Response: '%s'.", " ".join(f"0x{b:02X}" for b in response))
         return response
+    
+    def is_stat1_successful(self, stat1):
+        """
+        Check if Stat1 response indicates a successful command execution.
 
+        :param stat1: The Stat1 byte received from LR1121.
+        :return: True if the command was successful (CMD_OK or CMD_DAT), False otherwise.
+        """
+        command_status = (stat1 >> 1) & 0b111  # Extract bits 3:1
+        interrupt_status = stat1 & 0b1         # Extract bit 0
+
+        # Decode command status
+        command_status_map = {
+            0: "CMD_FAIL - Command could not be executed",
+            1: "CMD_PERR - Invalid opcode/arguments, possible DIO interrupt",
+            2: "CMD_OK - Command executed successfully",
+            3: "CMD_DAT - Command executed, data is being transmitted",
+        }
+        
+        command_status_str = command_status_map.get(command_status, "RFU - Reserved for future use")
+
+        # Decode interrupt status
+        interrupt_status_str = "No interrupt active" if interrupt_status == 0 else "At least one interrupt active"
+
+        # Logging debug details
+        logger.debug(f"Stat1 Raw Value: 0x{stat1:02X} (Binary: {stat1:08b}).")
+        logger.debug(f"Extracted Command Status: {command_status} ({command_status_str}).")
+        logger.debug(f"Extracted Interrupt Status: {interrupt_status} ({interrupt_status_str}).")
+
+        # Log overall success or failure
+        if command_status in (2, 3):  # CMD_OK (2) or CMD_DAT (3)
+            logger.info(f"Stat1: SUCCESS - {command_status_str}.")
+            return True
+        else:
+            logger.warning(f"Stat1: FAILURE - {command_status_str}.")
+            return False
 
     def begin(self, frequency, bandwidth, spreading_factor, coding_rate,
               preamble_length=8, sync_word=0x34):
@@ -187,11 +224,21 @@ class LR1121:
         :param preamble_length: Preamble length in symbols.
         :param sync_word: Sync word (1 byte). Typically 0x34 for public networks.
         """
-        logger.info("Beginning LR1121 initialization:")
-        logger.info(" Frequency: %s MHz, Bandwidth: %s kHz, SF: %d, CR: 4/%d",
-                     frequency, bandwidth, spreading_factor, coding_rate)
+        logger.info("Beginning LR1121 initialization...")
+        logger.info(" Frequency: %s MHz, Bandwidth: %s kHz, SF: %d, CR: 4/%d", frequency, bandwidth, spreading_factor, coding_rate)
 
         self.reset()
+    
+        stat1, *rest = self.get_version()
+        is_ok = self.is_stat1_successful(stat1)
+        if not is_ok:
+             raise ValueError("GetVersion command failed.")
+        
+        stat1,*rest = self.standby()
+        is_ok = self.is_stat1_successful(stat1)
+        if not is_ok:
+             raise ValueError("SetStandby command failed.")
+        return
 
         # Set packet type to LoRa
         self._send_command(self._CMD_SET_PACKET_TYPE, data=bytes([self._PACKET_TYPE_LORA]))
@@ -331,14 +378,20 @@ class LR1121:
             return None
         
     def standby(self):
-        logger.info("Setting standby mode...")
-        response = self.spi_command(self.CMD_MODE_STANDBY, True, 0x00, 0, 3)                
+        logger.info("Calling SetStandby mode.")
+        response = self.spi_command(self._CMD_MODE_STANDBY, True, b"\x00", 0, 3)                
         if response is None or len(response) < 3:
-            logger.error("No valid version response received.")
-            return None
+            logger.error("Invalid SetStandby response length.")
+            raise ValueError("Invalid SetStandby response length.")
         
         stat1 = response[0]
-        logger.debug(f"Standby command status: '{stat1}'.")
+        stat2 = response[1]
+        irq_status = response[2]
+        logger.debug(f"Standby command 'Stat1': '0x{stat1:02X}'.")
+        logger.debug(f"Standby command 'Stat2': '0x{stat2:02X}'.")
+        logger.debug(f"Standby command 'IrqStatus': '0x{irq_status:02X}'.")
+        
+        return (stat1, stat2, irq_status)
         
     def get_version(self):
         """
@@ -352,11 +405,11 @@ class LR1121:
 
         :return: A tuple (hardware, device, fw_major, fw_minor) if successful, or None if no valid response.
         """
-        logger.info("Querying version info.")
+        logger.info("Querying GetVersion info.")
         response = self.spi_command(self._CMD_GET_VERSION, False, b"", 5, 2)                
         if response is None or len(response) < 5:
-            logger.error("No valid version response received.")
-            return None
+            logger.error("Invalid GetVersion response length.")
+            raise ValueError("Invalid GetVersion response length.")
         
         stat1 = response[0]
         hw_version = response[1]
@@ -402,46 +455,42 @@ class LR1121:
 # ===== Example usage =====
 if __name__ == "__main__":
     from config import RADIO_CS_PIN, RADIO_RST_PIN, RADIO_BUSY_PIN, RADIO_DIO_PIN
-    # Example hardware configuration (adjust pins and SPI settings to your board)
-    cs = machine.Pin(RADIO_CS_PIN, machine.Pin.OUT, value=1)
-    rst = machine.Pin(RADIO_RST_PIN, machine.Pin.OUT)
-    busy = machine.Pin(RADIO_BUSY_PIN, machine.Pin.IN)
-    irq = machine.Pin(RADIO_DIO_PIN, machine.Pin.IN)
-    mosi = machine.Pin(6, machine.Pin.OUT)
-    miso = machine.Pin(3, machine.Pin.IN)
-    sck = machine.Pin(5, machine.Pin.OUT)
-    spi = machine.SPI(1, baudrate=1000000, polarity=0, phase=0, sck=sck, miso=miso, mosi=mosi)
-    spi.init()
-
-    # Create an LR1121 instance
-    lr = LR1121(spi, cs, rst, irq_pin=irq, busy_pin=busy)
-    lr.reset()
     
-    stat1, hw_version, device, fw_major, fw_minor = lr.get_version()
-    if stat1 == 0x00:
-        raise ValueError("GetVersion command failed.")
-    
-    #lr.standby()
+    try:
+        # Example hardware configuration (adjust pins and SPI settings to your board)
+        cs = machine.Pin(RADIO_CS_PIN, machine.Pin.OUT, value=1)
+        rst = machine.Pin(RADIO_RST_PIN, machine.Pin.OUT)
+        busy = machine.Pin(RADIO_BUSY_PIN, machine.Pin.IN)
+        irq = machine.Pin(RADIO_DIO_PIN, machine.Pin.IN)
+        mosi = machine.Pin(6, machine.Pin.OUT)
+        miso = machine.Pin(3, machine.Pin.IN)
+        sck = machine.Pin(5, machine.Pin.OUT)
+        spi = machine.SPI(1, baudrate=1000000, polarity=0, phase=0, sck=sck, miso=miso, mosi=mosi)
+        spi.init()
 
-    # # Initialize the module for LoRa operation:
-    # # Frequency: 915 MHz, Bandwidth: 125 kHz, SF: 7, CR: 4/5, default preamble, public sync word (0x34)
-    # lr.begin(frequency=868, bandwidth=125.0, spreading_factor=12, coding_rate=8)
+        # Create an LR1121 instance
+        lr = LR1121(spi, cs, rst, irq_pin=irq, busy_pin=busy)
 
-    # # Transmit a simple message
-    # message = b'Hello LR1121!'
-    # lr.transmit(message)
+        # Initialize the module for LoRa operation:
+        # Frequency: 915 MHz, Bandwidth: 125 kHz, SF: 7, CR: 4/5, default preamble, public sync word (0x34)
+        lr.begin(frequency=868, bandwidth=125.0, spreading_factor=12, coding_rate=8)
 
-    # # Try to receive a message (with 1000 ms timeout)
-    # received = lr.receive(timeout_ms=1000)
-    # if received:
-    #     logger.info("Message received: %s", received)
-    # else:
-    #     logger.info("No message received.")
+        # # Transmit a simple message
+        # message = b'Hello LR1121!'
+        # lr.transmit(message)
 
-    # # Read and print the RSSI
-    # rssi = lr.get_rssi()
-    # if rssi is not None:
-    #     logger.info("Current RSSI: %.2f dBm", rssi)
-        
-    lr.get_random_number()
-    lr.close()
+        # # Try to receive a message (with 1000 ms timeout)
+        # received = lr.receive(timeout_ms=1000)
+        # if received:
+        #     logger.info("Message received: %s", received)
+        # else:
+        #     logger.info("No message received.")
+
+        # # Read and print the RSSI
+        # rssi = lr.get_rssi()
+        # if rssi is not None:
+        #     logger.info("Current RSSI: %.2f dBm", rssi)
+            
+        #lr.get_random_number()
+    finally:
+        lr.close()
