@@ -8,7 +8,7 @@ from config import I2C_SDA, I2C_SCL, RADIO_CS_PIN, RADIO_BUSY_PIN, RADIO_RST_PIN
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
-logger = logging.getLogger("Main")
+logger = logging.getLogger(__name__)
 
 # Initialize I2C bus
 logger.info("Initializing I2C bus")
