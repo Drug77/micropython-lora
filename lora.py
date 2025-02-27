@@ -225,7 +225,7 @@ class LR1121:
         :param sync_word: Sync word (1 byte). Typically 0x34 for public networks.
         """
         logger.info("Beginning LR1121 initialization...")
-        logger.info(" Frequency: %s MHz, Bandwidth: %s kHz, SF: %d, CR: 4/%d", frequency, bandwidth, spreading_factor, coding_rate)
+        logger.info(" Frequency: %s MHz, Bandwidth: %s kHz, SF: %d, CR: 4/%d.", frequency, bandwidth, spreading_factor, coding_rate)
 
         self.reset()
     
@@ -417,7 +417,7 @@ class LR1121:
         fw_major = response[3]
         fw_minor = response[4]
         
-        logger.debug(f"GetVersion command status: '{stat1}'.")
+        logger.debug(f"GetVersion command 'Stat1': '0x{stat1:02X}'.")
         logger.info(f"Hardware version: '{hw_version}'.")
         logger.info(f"Device: '{device}'.")
         logger.info(f"Firmware: '{fw_major}.{fw_minor}'.")
@@ -444,17 +444,18 @@ class LR1121:
             return None
 
         stat1 = response[0]
-        logger.debug(f"GetRandomNumber command status: '{stat1}'.")
+        logger.debug(f"GetRandomNumber command 'Stat1': '0x{stat1:02X}'.")
         
         # The following 4 bytes are the random number.
         rand_bytes = response[1:5]
         rand_val = int.from_bytes(rand_bytes, 'big')
         logger.info(f"Random number: '{rand_val}'.")
+        
         return rand_val
 
 # ===== Example usage =====
 if __name__ == "__main__":
-    from config import RADIO_CS_PIN, RADIO_RST_PIN, RADIO_BUSY_PIN, RADIO_DIO_PIN
+    from config import RADIO_CS_PIN, RADIO_RST_PIN, RADIO_BUSY_PIN, RADIO_DIO_PIN, RADIO_MOSI_PIN, RADIO_MISO_PIN, RADIO_SCK_PIN
     
     try:
         # Example hardware configuration (adjust pins and SPI settings to your board)
@@ -462,9 +463,9 @@ if __name__ == "__main__":
         rst = machine.Pin(RADIO_RST_PIN, machine.Pin.OUT)
         busy = machine.Pin(RADIO_BUSY_PIN, machine.Pin.IN)
         irq = machine.Pin(RADIO_DIO_PIN, machine.Pin.IN)
-        mosi = machine.Pin(6, machine.Pin.OUT)
-        miso = machine.Pin(3, machine.Pin.IN)
-        sck = machine.Pin(5, machine.Pin.OUT)
+        mosi = machine.Pin(RADIO_MOSI_PIN, machine.Pin.OUT)
+        miso = machine.Pin(RADIO_MISO_PIN, machine.Pin.IN)
+        sck = machine.Pin(RADIO_SCK_PIN, machine.Pin.OUT)
         spi = machine.SPI(1, baudrate=1000000, polarity=0, phase=0, sck=sck, miso=miso, mosi=mosi)
         spi.init()
 
