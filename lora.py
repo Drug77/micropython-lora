@@ -13,10 +13,8 @@ import machine
 import time
 import logging
 
-# Configure module logger
-logging.basicConfig(level=logging.DEBUG)
+
 logger = logging.getLogger("LR1121")
-logger.setLevel(logging.DEBUG)
 
 class LR1121:
     """
@@ -38,13 +36,48 @@ class LR1121:
     _CMD_READ_BUFFER          = 0x010A  # Read received payload
     _CMD_GET_RSSI_INST        = 0x0205  # Get instantaneous RSSI
     _CMD_GET_VERSION          = 0x0101  # Command to get version info
-    _CMD_GET_RANDOM_NUMBER    = 0x0120
-    _CMD_MODE_STANDBY = 0x011C
+    _CMD_GET_RANDOM_NUMBER    = 0x0120  # Get a random number
+    
+    # Command to go into standby mode
+    _CMD_MODE_STANDBY = 0x011C  
+    _STANDBY_MODE_INTERNAL_RC_OSCILLATOR = 0x00 # Selects internal RC oscillator (Standby RC mode)
+    
+    # Defines what mode the device goes into after a packet transmission or a packet reception
+    _CMD_SET_RX_TX_FALLBACK_MODE = 0x0213
+    _FALLBACK_MODE_STANDBY_RC = 0x01 # Standby RC mode (default value).
+    
+    # The ClearIrq(...) command clears the selected interrupt signals by writing a 1 in the respective bit.
+    _CMD_CLEAR_IRQ = 0x0114
+    _CLEAR_IRQ_ALL = 0xFFFFFFFF
+    
+    # The Calibrate(...) command calibrates the requested blocks defined by the CalibParams parameter. 
+    _CMD_CALIBRATE = 0x010F  # Calibrate command
+    # Calibrate all blocks (LF_RC, HF_RC, PLL, ADC, IMG, PLL_TX)
+    _CALIBRATE_ALL = 0x3F # 0b00111111 (bits 0-5 set)
+    
+    # Command SetDioIrqParams(...) configures which interrupt signal should be activated on the DIO9 and/or DIO11
+    # interrupt pin (referred to as IRQ pin 1 and/or 2).
+    _CMD_SET_DIO_IRQ_PARAMS = 0x0113
+    # Disable TxDone (bit 2) and RxDone (bit 3) on DIO9
+    _IRQ_PARAMS_DIO9_NONE = 0x00000000  # Disable all interrupts on DIO9
+    _IRQ_PARAMS_DIO11_NONE = 0x00000000  # Disable all interrupts on DIO11
+    
+    _CMD_GET_ERRORS = 0x0100  # Get pending errors
+    _CMD_CLEAR_ERRORS = 0x010E  # Clear all error flags
+    
+    # Command constants
+    _CMD_SET_PACKET_TYPE = 0x020E  # Set packet type
+
+    # Packet type constants (from LR1121 manual)
+    PACKET_TYPE_NONE = 0x00  # No packet type selected
+    PACKET_TYPE_GFSK = 0x01  # (G)FSK modulation
+    PACKET_TYPE_LORA = 0x02  # LoRa modulation
+    PACKET_TYPE_LR_FHSS = 0x04  # LR-FHSS modulation
+    PACKET_TYPE_RFU = 0x03  # Reserved for future use
+    
     _DEVICE_LR1121 = 0x03
 
-    # Packet types
-    _PACKET_TYPE_LORA = 0x02
-    _BUSY_MAX_DELAY_MS = 300
+    _BUSY_MAX_DELAY_MS = 60
     _REBOOT_MAX_DELAY_MS = 300
 
     def __init__(self, spi, cs_pin, reset_pin, irq_pin=None, busy_pin=None, tcxo_voltage=0):
@@ -54,13 +87,10 @@ class LR1121:
         :param spi: An initialized machine.SPI object.
         :param cs_pin: Chip select (CS) pin (machine.Pin instance).
         :param reset_pin: Reset pin (machine.Pin instance).
-        :param irq_pin: (Optional) IRQ pin (machine.Pin instance) for interrupt handling.
-        :param tcxo_voltage: Optional TCXO voltage in volts. Set to 0 if not used.
         """
         self.spi = spi
         self.cs = cs_pin
         self.reset_pin = reset_pin
-        self.irq_pin = irq_pin
         self.busy_pin = busy_pin
         self.tcxo_voltage = tcxo_voltage
         self.busy_pin.irq(self.busy_handler, machine.Pin.IRQ_FALLING | machine.Pin.IRQ_RISING)
@@ -71,8 +101,6 @@ class LR1121:
         self.bandwidth = None
         self.spreading_factor = None
         self.coding_rate = None
-
-        logger.info("LR1121 instance created.")
 
     def busy_handler(self, busy_pin):
         self.is_busy = busy_pin.value() == 1
@@ -87,8 +115,6 @@ class LR1121:
         conflicts with other SPI devices or redundant power consumption.
         """
         logger.info("Closing LR1121 module.")
-        # Disable IRQ if it was configured
-        self.irq_pin.irq(None)
         # Deinitialize SPI
         self.spi.deinit()
         
@@ -96,7 +122,7 @@ class LR1121:
         """
         Reset the LR1121 module and wait until it is ready.
         """
-        logger.info("Resetting LR1121 module.")
+        logger.info("Resetting LR1121 module...")
         self.reset_pin.value(0)
         time.sleep_ms(10)
         self.reset_pin.value(1)
@@ -203,7 +229,7 @@ class LR1121:
 
         # Log overall success or failure
         if command_status in (2, 3):  # CMD_OK (2) or CMD_DAT (3)
-            logger.info(f"Stat1: SUCCESS - {command_status_str}.")
+            logger.debug(f"Stat1: SUCCESS - {command_status_str}.")
             return True
         else:
             logger.warning(f"Stat1: FAILURE - {command_status_str}.")
@@ -225,7 +251,7 @@ class LR1121:
         :param sync_word: Sync word (1 byte). Typically 0x34 for public networks.
         """
         logger.info("Beginning LR1121 initialization...")
-        logger.info(" Frequency: %s MHz, Bandwidth: %s kHz, SF: %d, CR: 4/%d.", frequency, bandwidth, spreading_factor, coding_rate)
+        logger.info("Frequency: %s MHz, Bandwidth: %s kHz, SF: %d, CR: 4/%d.", frequency, bandwidth, spreading_factor, coding_rate)
 
         self.reset()
     
@@ -234,10 +260,57 @@ class LR1121:
         if not is_ok:
              raise ValueError("GetVersion command failed.")
         
-        stat1,*rest = self.standby()
-        is_ok = self.is_stat1_successful(stat1)
-        if not is_ok:
+        stat1, *rest = self.standby()
+        if self.is_stat1_successful(stat1):
+            logger.info("Standby mode successfull.")
+        else:
              raise ValueError("SetStandby command failed.")
+    
+        stat1, *rest = self.set_rx_tx_fallback_mode()
+        if self.is_stat1_successful(stat1):
+            logger.info("Fallabck mode set successfully.")
+        else:
+             raise ValueError("SetRxTxFallbackMode command failed.")
+    
+        stat1, *rest = self.clear_irq()
+        if self.is_stat1_successful(stat1):
+            logger.info("Cleared interrupt signals successfully.")
+        else:
+             raise ValueError("ClearIrq command failed.")
+         
+        stat1, *rest = lr.set_dio_irq_params(self._IRQ_PARAMS_DIO9_NONE, self._IRQ_PARAMS_DIO11_NONE)
+        if lr.is_stat1_successful(stat1):
+            logger.info("All interrupts disabled successfully.")
+        else:
+            logger.error("Failed to disable all interrupts.")
+            
+        stat1, *rest = lr.calibrate(self._CALIBRATE_ALL)
+        if lr.is_stat1_successful(stat1):
+            logger.info("Calibration successful.")
+        else:
+            logger.error("Calibration failed.")
+            
+        # Get current errors
+        stat1, stat2, error_stat = lr.get_errors()
+        if lr.is_stat1_successful(stat1):
+            logger.info(f"Current error status: 0x{error_stat:04X}")
+        else:
+            logger.error("Failed to retrieve errors.")
+
+        # Clear all errors
+        stat1, *rest = lr.clear_errors()
+        if lr.is_stat1_successful(stat1):
+            logger.info("All errors cleared.")
+        else:
+            logger.error("Failed to clear errors.")
+            
+        # Example usage of set_packet_type
+        # Set packet type to LoRa
+        stat1, stat2, irq_status = lr.set_packet_type(lr.PACKET_TYPE_LORA)
+        if lr.is_stat1_successful(stat1):
+            logger.info("Packet type set to LoRa.")
+        else:
+            logger.error("Failed to set packet type.")
         return
 
         # Set packet type to LoRa
@@ -378,8 +451,8 @@ class LR1121:
             return None
         
     def standby(self):
-        logger.info("Calling SetStandby mode.")
-        response = self.spi_command(self._CMD_MODE_STANDBY, True, b"\x00", 0, 3)                
+        logger.info("Calling SetStandby mode command...")
+        response = self.spi_command(self._CMD_MODE_STANDBY, True, self._STANDBY_MODE_INTERNAL_RC_OSCILLATOR.to_bytes(1, "big"), 0, 3)                
         if response is None or len(response) < 3:
             logger.error("Invalid SetStandby response length.")
             raise ValueError("Invalid SetStandby response length.")
@@ -387,9 +460,224 @@ class LR1121:
         stat1 = response[0]
         stat2 = response[1]
         irq_status = response[2]
-        logger.debug(f"Standby command 'Stat1': '0x{stat1:02X}'.")
-        logger.debug(f"Standby command 'Stat2': '0x{stat2:02X}'.")
-        logger.debug(f"Standby command 'IrqStatus': '0x{irq_status:02X}'.")
+        logger.debug(f"SetStandby command 'Stat1': '0x{stat1:02X}'.")
+        logger.debug(f"SetStandby command 'Stat2': '0x{stat2:02X}'.")
+        logger.debug(f"SetStandby command 'IrqStatus': '0x{irq_status:02X}'.")
+        
+        return (stat1, stat2, irq_status)
+    
+    def set_rx_tx_fallback_mode(self):
+        logger.info("Calling SetRxTxFallbackMode command...")
+        response = self.spi_command(self._CMD_SET_RX_TX_FALLBACK_MODE, True, self._FALLBACK_MODE_STANDBY_RC.to_bytes(1, "big"), 0, 3)                
+        if response is None or len(response) < 3:
+            logger.error("Invalid SetRxTxFallbackMode response length.")
+            raise ValueError("Invalid SetRxTxFallbackMode response length.")
+        
+        stat1 = response[0]
+        stat2 = response[1]
+        irq_status = response[2]
+        logger.debug(f"SetRxTxFallbackMode command 'Stat1': '0x{stat1:02X}'.")
+        logger.debug(f"SetRxTxFallbackMode command 'Stat2': '0x{stat2:02X}'.")
+        logger.debug(f"SetRxTxFallbackMode command 'IrqStatus': '0x{irq_status:02X}'.")
+        
+        return (stat1, stat2, irq_status)
+    
+    def clear_irq(self):
+        logger.info("Calling ClearIrq command...")
+        response = self.spi_command(self._CMD_CLEAR_IRQ, True, self._CLEAR_IRQ_ALL.to_bytes(4, "big"), 0, 6)                
+        if response is None or len(response) < 6:
+            logger.error("Invalid ClearIrq response length.")
+            raise ValueError("Invalid ClearIrq response length.")
+        
+        stat1 = response[0]
+        stat2 = response[1]
+        irq_status = response[2:6]
+        irq_hex = " ".join(f"{byte:02X}" for byte in irq_status)
+        logger.debug(f"ClearIrq command 'Stat1': '0x{stat1:02X}'.")
+        logger.debug(f"ClearIrq command 'Stat2': '0x{stat2:02X}'.")
+        logger.debug(f"ClearIrq command 'IrqStatus': '{irq_hex}'.")
+        
+        return (stat1, stat2, irq_status)
+    
+    def set_dio_irq_params(self, irq1_to_enable, irq2_to_enable):
+        """
+        Configure which interrupt signals should be activated on the DIO9 and/or DIO11 interrupt pins.
+
+        :param irq1_to_enable: 32-bit bitmask for enabling interrupts on DIO9.
+        :param irq2_to_enable: 32-bit bitmask for enabling interrupts on DIO11.
+        :return: A tuple (stat1, stat2, irq_status) if successful, or None if the response is invalid.
+        """
+        logger.info("Calling SetDioIrqParams command...")
+        
+        # Prepare the data bytes: Irq1ToEnable (4 bytes) + Irq2ToEnable (4 bytes)
+        data = irq1_to_enable.to_bytes(4, 'big') + irq2_to_enable.to_bytes(4, 'big')
+        
+        # Send the command and expect 3 bytes in response (Stat1, Stat2, IrqStatus)
+        response = self.spi_command(self._CMD_SET_DIO_IRQ_PARAMS, True, data, 0, 10)
+        
+        if response is None or len(response) < 10:
+            logger.error("Invalid SetDioIrqParams response length.")
+            raise ValueError("Invalid SetDioIrqParams response length.")
+        
+        stat1 = response[0]
+        stat2 = response[1]
+        irq_status = response[2:10]
+        irq_hex = " ".join(f"{byte:02X}" for byte in irq_status)
+        logger.debug(f"SetDioIrqParams command 'Stat1': '0x{stat1:02X}'.")
+        logger.debug(f"SetDioIrqParams command 'Stat2': '0x{stat2:02X}'.")
+        logger.debug(f"SetDioIrqParams command 'IrqStatus': '{irq_hex}'.")
+        
+        return (stat1, stat2, irq_status)
+    
+    def calibrate(self, calib_params):
+        """
+        Calibrate the specified blocks of the LR1121.
+
+        :param calib_params: 1-byte bitmask specifying which blocks to calibrate.
+            - Bit 0: LF_RC calibration
+            - Bit 1: HF_RC calibration
+            - Bit 2: PLL calibration
+            - Bit 3: ADC calibration
+            - Bit 4: IMG calibration
+            - Bit 5: PLL_TX calibration
+            - Bits 6-7: RFU (Reserved for Future Use)
+        :return: A tuple (stat1, stat2, irq_status) if successful, or None if the response is invalid.
+        """
+        logger.info("Calling Calibrate command...")
+        
+        # Prepare the data byte: CalibParams (1 byte)
+        data = calib_params.to_bytes(1, 'big')
+        
+        # Send the command and expect 3 bytes in response (Stat1, Stat2, IrqStatus)
+        response = self.spi_command(self._CMD_CALIBRATE, True, data, 0, 3)
+        
+        if response is None or len(response) < 3:
+            logger.error("Invalid Calibrate response length.")
+            raise ValueError("Invalid Calibrate response length.")
+        
+        stat1 = response[0]
+        stat2 = response[1]
+        irq_status = response[2]
+        
+        logger.debug(f"Calibrate command 'Stat1': '0x{stat1:02X}'.")
+        logger.debug(f"Calibrate command 'Stat2': '0x{stat2:02X}'.")
+        logger.debug(f"Calibrate command 'IrqStatus': '0x{irq_status:02X}'.")
+        
+        return (stat1, stat2, irq_status)
+    
+    def get_errors(self):
+        """
+        Retrieve the pending errors that occurred since the last ClearErrors or circuit startup.
+
+        :return: A tuple (stat1, stat2, error_stat) if successful.
+        """
+        logger.info("Calling GetErrors command...")
+        
+        # Send the command and read the response
+        response = self.spi_command(self._CMD_GET_ERRORS, False, b"", 3, 2)
+        
+        if response is None or len(response) < 3:
+            logger.error("Invalid GetErrors response length.")
+            raise ValueError("Invalid GetErrors response length.")
+        
+        stat1 = response[0]
+        stat2 = response[1]
+        error_stat = response[2]
+        
+        logger.debug(f"GetErrors command 'Stat1': '0x{stat1:02X}'.")
+        logger.debug(f"GetErrors command 'Stat2': '0x{stat2:02X}'.")
+        logger.debug(f"GetErrors command 'ErrorStat': '0x{error_stat:04X}'.")
+        
+        # Log detailed error information if errors are present
+        if error_stat != 0:
+            self._log_error_details(error_stat)
+        
+        return (stat1, stat2, error_stat)
+
+    def clear_errors(self):
+        """
+        Clear all error flags in the LR1121.
+
+        :return: A tuple (stat1, stat2) if successful.
+        """
+        logger.info("Calling ClearErrors command.")
+        
+        # Send the command and read the response
+        response = self.spi_command(self._CMD_CLEAR_ERRORS, True, b"", 2, 2)
+        
+        if response is None or len(response) < 2:
+            logger.error("Invalid ClearErrors response length.")
+            raise ValueError("Invalid ClearErrors response length.")
+        
+        stat1 = response[0]
+        stat2 = response[1]
+        
+        logger.debug(f"ClearErrors command 'Stat1': '0x{stat1:02X}'.")
+        logger.debug(f"ClearErrors command 'Stat2': '0x{stat2:02X}'.")
+        
+        return (stat1, stat2)
+
+    def _log_error_details(self, error_stat):
+        """
+        Log detailed information about the errors in the ErrorStat byte.
+
+        :param error_stat: The 16-bit error status byte.
+        """
+        error_messages = {
+            0: "LF_RC_CALIB_ERR: Calibration of low frequency RC was not done.",
+            1: "HF_RC_CALIB_ERR: Calibration of high frequency RC was not done.",
+            2: "ADC_CALIB_ERR: Calibration of ADC was not done.",
+            3: "PLL_CALIB_ERR: Calibration of maximum and minimum frequencies was not done.",
+            4: "IMG_CALIB_ERR: Calibration of the image rejection was not done.",
+            5: "HF_XOSC_START_ERR: High frequency XOSC did not start correctly.",
+            6: "LF_XOSC_START_ERR: Low frequency XOSC did not start correctly.",
+            7: "PLL_LOCK_ERR: The PLL did not lock.",
+            8: "RX_ADC_OFFSET_ERR: Calibration of ADC offset was not done.",
+        }
+        
+        logger.debug("Error details:")
+        for bit, message in error_messages.items():
+            if error_stat & (1 << bit):
+                logger.debug(f"  - {message}")
+                
+    def set_packet_type(self, packet_type):
+        """
+        Set the packet type for the LR1121 modem.
+
+        :param packet_type: The packet type to set (use class constants: PACKET_TYPE_*).
+        :return: A tuple (stat1, stat2, irq_status) if successful.
+        """
+        logger.info("Calling SetPacketType command...")
+        
+        # Validate the packet type
+        valid_packet_types = [
+            self.PACKET_TYPE_NONE,
+            self.PACKET_TYPE_GFSK,
+            self.PACKET_TYPE_LORA,
+            self.PACKET_TYPE_LR_FHSS,
+            self.PACKET_TYPE_RFU,
+        ]
+        if packet_type not in valid_packet_types:
+            logger.error(f"Invalid packet type: '0x{packet_type:02X}'.")
+            raise ValueError(f"Invalid packet type: '0x{packet_type:02X}'.")
+        
+        # Pack the packet type into a single byte
+        data = packet_type.to_bytes(1, 'big')
+        
+        # Send the command and read the response
+        response = self.spi_command(self._CMD_SET_PACKET_TYPE, True, data, 0, 3)
+        
+        if response is None or len(response) < 3:
+            logger.error("Invalid SetPacketType response length.")
+            raise ValueError("Invalid SetPacketType response length.")
+        
+        stat1 = response[0]
+        stat2 = response[1]
+        irq_status = response[2]
+        
+        logger.debug(f"SetPacketType command 'Stat1': '0x{stat1:02X}'.")
+        logger.debug(f"SetPacketType command 'Stat2': '0x{stat2:02X}'.")
+        logger.debug(f"SetPacketType command 'IrqStatus': '0x{irq_status:02X}'.")
         
         return (stat1, stat2, irq_status)
         
@@ -405,7 +693,7 @@ class LR1121:
 
         :return: A tuple (hardware, device, fw_major, fw_minor) if successful, or None if no valid response.
         """
-        logger.info("Querying GetVersion info.")
+        logger.info("Calling GetVersion info command...")
         response = self.spi_command(self._CMD_GET_VERSION, False, b"", 5, 2)                
         if response is None or len(response) < 5:
             logger.error("Invalid GetVersion response length.")
@@ -436,7 +724,7 @@ class LR1121:
 
         :return: A 32-bit unsigned integer with the random number, or None if the response is invalid.
         """
-        logger.info("Requesting random number.")
+        logger.info("Calling random number command...")
         # Send command 0x0120 with no extra data and expect 5 bytes in response.
         response = self.spi_command(self._CMD_GET_RANDOM_NUMBER, False, b"", 5, 2)
         if response is None or len(response) < 5:
@@ -456,6 +744,9 @@ class LR1121:
 # ===== Example usage =====
 if __name__ == "__main__":
     from config import RADIO_CS_PIN, RADIO_RST_PIN, RADIO_BUSY_PIN, RADIO_DIO_PIN, RADIO_MOSI_PIN, RADIO_MISO_PIN, RADIO_SCK_PIN
+    
+    # Configure module logger
+    logging.basicConfig(level=logging.INFO)
     
     try:
         # Example hardware configuration (adjust pins and SPI settings to your board)
