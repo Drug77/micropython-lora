@@ -1,14 +1,3 @@
-"""
-lr1121.py - MicroPython driver for the LR1121 radio transceiver module
-
-This library provides basic functions for initializing and communicating with the LR1121.
-It is adapted from the Arduino Radiolib LR11x0 code and tailored specifically for the LR1121.
-
-Author: Your Name
-Date: YYYY-MM-DD
-License: MIT
-"""
-
 import machine
 import time
 import logging
@@ -25,6 +14,7 @@ class LR1121:
     """
 
     # Command constants (a few examples from the LR11x0 datasheet)
+    _CMD_SET_RF_FREQUENCY     = 0x0208  # Set frequency
     _CMD_SET_PACKET_TYPE      = 0x020E  # Set packet type (LoRa, GFSK, etc.)
     _CMD_SET_RF_FREQUENCY     = 0x020B  # Set radio frequency
     _CMD_SET_MODULATION_PARAMS= 0x020F  # Set modulation parameters (for LoRa)
@@ -75,9 +65,23 @@ class LR1121:
     PACKET_TYPE_LR_FHSS = 0x04  # LR-FHSS modulation
     PACKET_TYPE_RFU = 0x03  # Reserved for future use
     
+    # LoRa Coding Rate Constants (from Table 8-4)
+    LORA_CR_4_5 = 0x01    # Short interleaver CR=4/5
+    LORA_CR_4_6 = 0x02    # Short interleaver CR=4/6
+    LORA_CR_4_7 = 0x03    # Short interleaver CR=4/7
+    LORA_CR_4_8 = 0x04    # Short interleaver CR=4/8
+    LORA_CR_LI_4_5 = 0x05 # Long interleaver CR=4/5
+    LORA_CR_LI_4_6 = 0x06 # Long interleaver CR=4/6
+    LORA_CR_LI_4_8 = 0x07 # Long interleaver CR=4/8
+    
+    # In the LR1121 class constants:
+    _CMD_SET_PACKET_PARAMS = 0x0210  # Set packet parameters (LoRa)
+    _CMD_SET_PA_CONFIG = 0x020E      # Configure PA settings
+    _CMD_SET_TX_PARAMS = 0x020D      # Set TX power and ramp time
+    
     _DEVICE_LR1121 = 0x03
 
-    _BUSY_MAX_DELAY_MS = 60
+    _BUSY_MAX_DELAY_MS = 80
     _REBOOT_MAX_DELAY_MS = 300
 
     def __init__(self, spi, cs_pin, reset_pin, irq_pin=None, busy_pin=None, tcxo_voltage=0):
@@ -186,7 +190,7 @@ class LR1121:
         while self.busy_pin.value() == 1:
             if time.ticks_diff(deadline, time.ticks_ms()) < 0:
                 logger.error("Timeout waiting for BUSY to go low after SPI command.")
-                raise TimeoutError("Timeout waiting for BUSY to go low after SPI command.")
+                raise ValueError("Timeout waiting for BUSY to go low after SPI command.")
             time.sleep_ms(10)
 
         logger.debug("BUSY pin is LOW, proceeding with read.")
@@ -278,101 +282,103 @@ class LR1121:
         else:
              raise ValueError("ClearIrq command failed.")
          
-        stat1, *rest = lr.set_dio_irq_params(self._IRQ_PARAMS_DIO9_NONE, self._IRQ_PARAMS_DIO11_NONE)
-        if lr.is_stat1_successful(stat1):
+        stat1, *rest = self.set_dio_irq_params(self._IRQ_PARAMS_DIO9_NONE, self._IRQ_PARAMS_DIO11_NONE)
+        if self.is_stat1_successful(stat1):
             logger.info("All interrupts disabled successfully.")
         else:
             logger.error("Failed to disable all interrupts.")
             
-        stat1, *rest = lr.calibrate(self._CALIBRATE_ALL)
-        if lr.is_stat1_successful(stat1):
+        stat1, *rest = self.calibrate(self._CALIBRATE_ALL)
+        if self.is_stat1_successful(stat1):
             logger.info("Calibration successful.")
         else:
             logger.error("Calibration failed.")
             
         # Get current errors
-        stat1, stat2, error_stat = lr.get_errors()
-        if lr.is_stat1_successful(stat1):
+        stat1, stat2, error_stat = self.get_errors()
+        if self.is_stat1_successful(stat1):
             logger.info(f"Current error status: 0x{error_stat:04X}")
         else:
             logger.error("Failed to retrieve errors.")
 
         # Clear all errors
-        stat1, *rest = lr.clear_errors()
-        if lr.is_stat1_successful(stat1):
+        stat1, *rest = self.clear_errors()
+        if self.is_stat1_successful(stat1):
             logger.info("All errors cleared.")
         else:
             logger.error("Failed to clear errors.")
             
+        # Set radio frequency (convert MHz to Hz)
+        frequency_mhz = 868
+        frequency_hz = int(frequency_mhz * 1e6)
+        stat1, *_ = self.set_frequency(frequency_hz)
+        if not self.is_stat1_successful(stat1):
+            raise RuntimeError("Failed to set frequency.")
+            
         # Example usage of set_packet_type
         # Set packet type to LoRa
-        stat1, stat2, irq_status = lr.set_packet_type(lr.PACKET_TYPE_LORA)
-        if lr.is_stat1_successful(stat1):
+        stat1, *rest = self.set_packet_type(lr.PACKET_TYPE_LORA)
+        if self.is_stat1_successful(stat1):
             logger.info("Packet type set to LoRa.")
         else:
             logger.error("Failed to set packet type.")
+            
+        # Maximum range configuration for LR1121
+        stat1, *rest = self.set_modulation_params(
+            sf=12,                      # Highest spreading factor (SF12)
+            bw_khz=62.5,                # Narrowest bandwidth (62.5 kHz)
+            cr_code=self.LORA_CR_4_8,   # Strongest error correction (4/8 coding rate)
+            ldro=1                      # Enable Low Data Rate Optimization
+        )
+        if self.is_stat1_successful(stat1):
+            logger.info("Modulation parameters set successfuly.")
+        else:
+            logger.error("Failed to set modulation parameters.")
+            
+        # Set packet parameters (max preamble, CRC enabled)
+        stat1, *_ = self.set_packet_params(preamble_length=65535, crc_en=1)
+        if not self.is_stat1_successful(stat1):
+            raise RuntimeError("Failed to set packet params.")
+        
+        # Configure PA for high power
+        stat1, *_ = self.set_pa_config(pa_sel=1, pa_duty_cycle=7)
+        if not self.is_stat1_successful(stat1):
+            raise RuntimeError("PA config failed.")
+        
+        # Set TX power to maximum
+        stat1, *_ = self.set_tx_params(power=22)
+        if not self.is_stat1_successful(stat1):
+            raise RuntimeError("TX params config failed.")
+        
+        logger.info("LR1121 configured for max power and range.")
         return
-
-        # Set packet type to LoRa
-        self._send_command(self._CMD_SET_PACKET_TYPE, data=bytes([self._PACKET_TYPE_LORA]))
-        logger.debug("Packet type set to LoRa.")
-
-        # Set radio frequency (command takes 4-byte frequency in Hz)
-        freq_hz = int(frequency * 1e6)
-        freq_data = freq_hz.to_bytes(4, 'big')
-        self._send_command(self._CMD_SET_RF_FREQUENCY, data=freq_data)
-        self.frequency = frequency
-        logger.debug("Frequency set to %d Hz", freq_hz)
-
-        # Set modulation parameters (LoRa)
-        # Format: [SF, BW_reg, (CR - 4), LDRO]
-        # For simplicity, LDRO (low data rate optimization) is set to 0 (automatic)
-        bw_reg = self._bandwidth_to_reg(bandwidth)
-        mod_params = bytes([spreading_factor, bw_reg, coding_rate - 4, 0])
-        self._send_command(self._CMD_SET_MODULATION_PARAMS, data=mod_params)
-        self.spreading_factor = spreading_factor
-        self.bandwidth = bandwidth
-        self.coding_rate = coding_rate
-        logger.debug("Modulation parameters set: SF=%d, BW_reg=0x%02X, CR=4/%d",
-                      spreading_factor, bw_reg, coding_rate)
-
-        # Set packet parameters (LoRa)
-        # Format: [Preamble (2 bytes), Header (0=explicit), Payload length (0 for variable), CRC (1=enabled), Invert IQ (0=standard)]
-        pkt_params = preamble_length.to_bytes(2, 'big') + bytes([0x00, 0x00, 0x01, 0x00])
-        self._send_command(self._CMD_SET_PACKET_PARAMS, data=pkt_params)
-        logger.debug("Packet parameters set: Preamble=%d symbols", preamble_length)
 
         # Set LoRa sync word
         self._send_command(self._CMD_SET_LORA_SYNC_WORD, data=bytes([sync_word]))
         logger.debug("Sync word set to 0x%02X", sync_word)
 
-        logger.info("LR1121 initialization complete.")
 
-    def _bandwidth_to_reg(self, bw):
+    def _bandwidth_to_reg(self, bw: float) -> int:
         """
-        Convert LoRa bandwidth in kHz to register value.
+        Convert bandwidth in kHz to BWL register value.
+
+        :param bw: Bandwidth in kHz (62.5, 125, 250, 500).
+        :return: Register value (0x03, 0x04, 0x05, 0x06).
+        :raises ValueError: For invalid bandwidth.
+        """
+        bw_map = {
+            62.5: 0x03,
+            125.0: 0x04,
+            250.0: 0x05,
+            500.0: 0x06
+        }
         
-        Valid conversions (approximate):
-          62.5 kHz -> 0x03
-          125.0 kHz -> 0x04
-          250.0 kHz -> 0x05
-          500.0 kHz -> 0x06
-
-        :param bw: Bandwidth in kHz.
-        :return: Corresponding register value.
-        :raises ValueError: If the bandwidth is not supported.
-        """
-        if abs(bw - 62.5) < 0.1:
-            return 0x03
-        elif abs(bw - 125.0) < 0.1:
-            return 0x04
-        elif abs(bw - 250.0) < 0.1:
-            return 0x05
-        elif abs(bw - 500.0) < 0.1:
-            return 0x06
-        else:
-            logger.error("Invalid bandwidth: %s kHz", bw)
-            raise ValueError("Invalid bandwidth value")
+        # Allow slight floating point tolerance
+        for valid_bw, reg in bw_map.items():
+            if abs(bw - valid_bw) < 0.1:
+                return reg
+    
+        raise ValueError(f"Invalid LoRa bandwidth '{bw:.1f}' kHz. Valid values: 62.5, 125, 250, 500.")
 
     def transmit(self, data):
         """
@@ -640,6 +646,39 @@ class LR1121:
             if error_stat & (1 << bit):
                 logger.debug(f"  - {message}")
                 
+    def set_frequency(self, frequency_hz: int) -> tuple:
+        """
+        Set the radio frequency for transmission and reception.
+
+        :param frequency_hz: Frequency in Hertz (Hz).
+        :return: Tuple (stat1, stat2, irq_status) from LR1121 response.
+        :raises ValueError: If the response is invalid.
+        """
+        logger.info("Setting frequency to %d Hz...", frequency_hz)
+        
+        # Convert frequency to 4-byte big-endian
+        data = frequency_hz.to_bytes(4, 'big')
+        
+        # Send command and read response (6 bytes: Stat1, Stat2, 4-byte IrqStatus)
+        response = self.spi_command(
+            cmd=self._CMD_SET_RF_FREQUENCY,
+            write=True,
+            data=data,
+            read_length=0,
+            pre_read_length=6
+        )
+        
+        if len(response) < 6:
+            logger.error("Invalid response length for SetRfFrequency.")
+            raise ValueError("Invalid SetRfFrequency response.")
+        
+        stat1 = response[0]
+        stat2 = response[1]
+        irq_status = response[2:6]
+        
+        logger.debug("SetFrequency Stat1: 0x%02X, Stat2: 0x%02X", stat1, stat2)
+        return (stat1, stat2, irq_status)
+                
     def set_packet_type(self, packet_type):
         """
         Set the packet type for the LR1121 modem.
@@ -680,6 +719,162 @@ class LR1121:
         logger.debug(f"SetPacketType command 'IrqStatus': '0x{irq_status:02X}'.")
         
         return (stat1, stat2, irq_status)
+    
+    def set_modulation_params(self, sf: int, bw_khz: float, cr_code: int, ldro: int) -> tuple:
+        """
+        Configure LoRa modulation parameters.
+
+        :param sf: Spreading factor (5-12).
+        :param bw_khz: Bandwidth in kHz (62.5, 125, 250, 500).
+        :param cr_code: Coding rate code (0x01 to 0x07, see LORA_CR_* constants).
+        :param ldro: Low Data Rate Optimization (0: disabled, 1: enabled).
+        :return: Tuple (stat1, stat2, irq_status) from LR1121 response.
+        :raises ValueError: If parameters are invalid.
+        """
+        logger.info("Configuring LoRa modulation parameters: SF=%d, BW=%.1f kHz, CR=0x%02X, LDRO=%d.", 
+                    sf, bw_khz, cr_code, ldro)
+
+        # Validate spreading factor
+        if not (5 <= sf <= 12):
+            raise ValueError(f"Invalid spreading factor '{sf}'. Must be 5-12.")
+
+        # Convert bandwidth to register value
+        try:
+            bw_reg = self._bandwidth_to_reg(bw_khz)
+        except ValueError as e:
+            logger.error("Bandwidth validation failed: '%s'.", str(e))
+            raise
+
+        # Validate coding rate
+        valid_cr_codes = [self.LORA_CR_4_5, self.LORA_CR_4_6, self.LORA_CR_4_7, self.LORA_CR_4_8,
+                        self.LORA_CR_LI_4_5, self.LORA_CR_LI_4_6, self.LORA_CR_LI_4_8]
+        if cr_code not in valid_cr_codes:
+            raise ValueError(f"Invalid CR code '0x{cr_code:02X}'. Use LORA_CR_* constants.")
+
+        # Validate LDRO
+        if ldro not in (0, 1):
+            raise ValueError("LDRO must be 0 (disabled) or 1 (enabled).")
+
+        # Construct command data: [SF, BWL, CR, LDRO]
+        data = bytes([sf, bw_reg, cr_code, ldro])
+        logger.debug("Modulation params data: '%s'.", " ".join(f"0x{b:02X}" for b in data))
+
+        # Send command (0x020F) with 6-byte response (Stat1, Stat2, 4-byte IrqStatus)
+        response = self.spi_command(
+            cmd=self._CMD_SET_MODULATION_PARAMS,
+            write=True,
+            data=data,
+            read_length=0,
+            pre_read_length=6  # Expect 6 bytes: Stat1, Stat2, IrqStatus[4]
+        )
+
+        # Parse response
+        if len(response) < 6:
+            logger.error("Invalid response length '%d' for SetModulationParams.", len(response))
+            raise ValueError("Incomplete response for SetModulationParams.")
+
+        stat1 = response[0]
+        stat2 = response[1]
+        irq_status = response[2:6]  # 4 bytes (32-bit IrqStatus)
+        
+        logger.debug(f"SetModulationParams command 'Stat1': '0x{stat1:02X}'.")
+
+        return (stat1, stat2, irq_status)
+    
+    def set_packet_params(self, preamble_length=65535, header_type=0x00, payload_len=0, crc_en=1, invert_iq=0):
+        """
+        Configure LoRa packet parameters for maximum range.
+        
+        :param preamble_length: Preamble length in symbols (default 65535 for max).
+        :param header_type: 0x00 (explicit header), 0x01 (implicit).
+        :param payload_len: 0 (variable length) or fixed length.
+        :param crc_en: 1 (CRC enabled), 0 (disabled).
+        :param invert_iq: 0 (standard), 1 (inverted).
+        :return: Tuple (stat1, stat2, irq_status) from LR1121.
+        """
+        logger.info("Setting LoRa packet params: Preamble=%d, CRC=%d", preamble_length, crc_en)
+        
+        # Pack data: [Preamble(2B), HeaderType, PayloadLen, CRC, InvertIQ]
+        data = (
+            preamble_length.to_bytes(2, 'big') +
+            bytes([header_type, payload_len, crc_en, invert_iq])
+        )
+        
+        # Send command and read response (Stat1, Stat2, 4-byte IrqStatus)
+        response = self.spi_command(
+            cmd=self._CMD_SET_PACKET_PARAMS,
+            write=True,
+            data=data,
+            read_length=0,
+            pre_read_length=6  # Expect 6 bytes: Stat1, Stat2, 4-byte IrqStatus
+        )
+        
+        if len(response) < 6:
+            raise ValueError("Invalid SetPacketParams response.")
+        
+        stat1, stat2 = response[0], response[1]
+        irq_status = response[2:6]
+        
+        logger.debug(f"SetPacketParams command 'Stat1': '0x{stat1:02X}'.")
+        
+        return (stat1, stat2, irq_status)
+    
+    def set_pa_config(self, pa_sel=1, reg_pa_supply=0, pa_duty_cycle=7, pa_hp_sel=7):
+        """
+        Configure PA for maximum power output (HP PA with duty cycle 7).
+        
+        :param pa_sel: 0 (LP PA), 1 (HP PA), 2 (HF PA).
+        :param reg_pa_supply: 0 (VBAT), 1 (VREG).
+        :param pa_duty_cycle: 0-7 (higher = more power).
+        :param pa_hp_sel: 0-7 (HP PA size, 7 = max).
+        :return: Tuple (stat1, stat2, irq_status).
+        """
+        logger.info("Configuring PA...")
+        
+        # Pack data: [PaSel, RegPaSupply, PaDutyCycle, PaHpSel]
+        data = bytes([pa_sel, reg_pa_supply, pa_duty_cycle, pa_hp_sel])
+        
+        response = self.spi_command(
+            cmd=self._CMD_SET_PA_CONFIG,
+            write=True,
+            data=data,
+            read_length=0,
+            pre_read_length=3  # Stat1, Stat2, 1-byte IrqStatus
+        )
+        
+        if len(response) < 3:
+            raise ValueError("Invalid SetPaConfig response.")
+        
+        stat1, stat2, irq = response[0], response[1], response[2]
+        return (stat1, stat2, irq)
+    
+    def set_tx_params(self, power=22, ramp_time=0):
+        """
+        Set TX power and ramp time for maximum output.
+        
+        :param power: Output power in dBm (HP PA: up to 22 dBm).
+        :param ramp_time: 0 (fastest) to 7 (slowest).
+        :return: Tuple (stat1, stat2, irq_status).
+        """
+        logger.info("Setting TX power: %d dBm, ramp=%d.", power, ramp_time)
+        
+        # Power is clipped to 0-22 dBm for HP PA
+        power = max(0, min(power, 22))
+        data = bytes([power, ramp_time])
+        
+        response = self.spi_command(
+            cmd=self._CMD_SET_TX_PARAMS,
+            write=True,
+            data=data,
+            read_length=0,
+            pre_read_length=3  # Stat1, Stat2, 1-byte IrqStatus
+        )
+        
+        if len(response) < 3:
+            raise ValueError("Invalid SetTxParams response.")
+        
+        stat1, stat2, irq = response[0], response[1], response[2]
+        return (stat1, stat2, irq)
         
     def get_version(self):
         """
