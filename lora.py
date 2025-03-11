@@ -13,76 +13,80 @@ class LR1121:
     It provides basic methods for initialization, transmission, reception and reading the RSSI.
     """
 
-    # Command constants (a few examples from the LR11x0 datasheet)
-    _CMD_SET_RF_FREQUENCY     = 0x0208  # Set frequency
-    _CMD_SET_PACKET_TYPE      = 0x020E  # Set packet type (LoRa, GFSK, etc.)
-    _CMD_SET_RF_FREQUENCY     = 0x020B  # Set radio frequency
-    _CMD_SET_MODULATION_PARAMS= 0x020F  # Set modulation parameters (for LoRa)
-    _CMD_SET_PACKET_PARAMS    = 0x0210  # Set packet parameters (for LoRa)
-    _CMD_SET_LORA_SYNC_WORD   = 0x022B  # Set LoRa sync word
-    _CMD_WRITE_BUFFER         = 0x0109  # Write payload to the buffer
-    _CMD_SET_TX               = 0x020A  # Start transmission
-    _CMD_SET_RX               = 0x0209  # Start reception
-    _CMD_READ_BUFFER          = 0x010A  # Read received payload
-    _CMD_GET_RSSI_INST        = 0x0205  # Get instantaneous RSSI
-    _CMD_GET_VERSION          = 0x0101  # Command to get version info
-    _CMD_GET_RANDOM_NUMBER    = 0x0120  # Get a random number
-    
-    # Command to go into standby mode
-    _CMD_MODE_STANDBY = 0x011C  
-    _STANDBY_MODE_INTERNAL_RC_OSCILLATOR = 0x00 # Selects internal RC oscillator (Standby RC mode)
-    
-    # Defines what mode the device goes into after a packet transmission or a packet reception
-    _CMD_SET_RX_TX_FALLBACK_MODE = 0x0213
-    _FALLBACK_MODE_STANDBY_RC = 0x01 # Standby RC mode (default value).
-    
-    # The ClearIrq(...) command clears the selected interrupt signals by writing a 1 in the respective bit.
-    _CMD_CLEAR_IRQ = 0x0114
-    _CLEAR_IRQ_ALL = 0xFFFFFFFF
-    
-    # The Calibrate(...) command calibrates the requested blocks defined by the CalibParams parameter. 
-    _CMD_CALIBRATE = 0x010F  # Calibrate command
-    # Calibrate all blocks (LF_RC, HF_RC, PLL, ADC, IMG, PLL_TX)
-    _CALIBRATE_ALL = 0x3F # 0b00111111 (bits 0-5 set)
-    
-    # Command SetDioIrqParams(...) configures which interrupt signal should be activated on the DIO9 and/or DIO11
-    # interrupt pin (referred to as IRQ pin 1 and/or 2).
-    _CMD_SET_DIO_IRQ_PARAMS = 0x0113
-    # Disable TxDone (bit 2) and RxDone (bit 3) on DIO9
-    _IRQ_PARAMS_DIO9_NONE = 0x00000000  # Disable all interrupts on DIO9
-    _IRQ_PARAMS_DIO11_NONE = 0x00000000  # Disable all interrupts on DIO11
-    
-    _CMD_GET_ERRORS = 0x0100  # Get pending errors
-    _CMD_CLEAR_ERRORS = 0x010E  # Clear all error flags
-    
-    # Command constants
-    _CMD_SET_PACKET_TYPE = 0x020E  # Set packet type
+    # System Configuration Commands
+    _CMD_CALIBRATE                  = 0x010F   # Calibrate RC oscillators, PLL, ADC, etc.
+    _CMD_MODE_STANDBY               = 0x011C   # Enter standby mode (RC/XOSC)
+    _CMD_GET_VERSION                = 0x0101   # Get chip hardware/firmware version
 
-    # Packet type constants (from LR1121 manual)
-    PACKET_TYPE_NONE = 0x00  # No packet type selected
-    PACKET_TYPE_GFSK = 0x01  # (G)FSK modulation
-    PACKET_TYPE_LORA = 0x02  # LoRa modulation
-    PACKET_TYPE_LR_FHSS = 0x04  # LR-FHSS modulation
-    PACKET_TYPE_RFU = 0x03  # Reserved for future use
-    
-    # LoRa Coding Rate Constants (from Table 8-4)
-    LORA_CR_4_5 = 0x01    # Short interleaver CR=4/5
-    LORA_CR_4_6 = 0x02    # Short interleaver CR=4/6
-    LORA_CR_4_7 = 0x03    # Short interleaver CR=4/7
-    LORA_CR_4_8 = 0x04    # Short interleaver CR=4/8
-    LORA_CR_LI_4_5 = 0x05 # Long interleaver CR=4/5
-    LORA_CR_LI_4_6 = 0x06 # Long interleaver CR=4/6
-    LORA_CR_LI_4_8 = 0x07 # Long interleaver CR=4/8
-    
-    # In the LR1121 class constants:
-    _CMD_SET_PACKET_PARAMS = 0x0210  # Set packet parameters (LoRa)
-    _CMD_SET_PA_CONFIG = 0x020E      # Configure PA settings
-    _CMD_SET_TX_PARAMS = 0x020D      # Set TX power and ramp time
-    
-    _DEVICE_LR1121 = 0x03
+    # Error Handling Commands
+    _CMD_CLEAR_ERRORS               = 0x010E   # Clear all error flags (PLL/ADC/calibration errors)
+    _CMD_GET_ERRORS                 = 0x0100   # Get pending error status
 
-    _BUSY_MAX_DELAY_MS = 80
-    _REBOOT_MAX_DELAY_MS = 300
+    # Interrupt Configuration Commands
+    _CMD_CLEAR_IRQ                  = 0x0114   # Clear interrupt flags
+    _CMD_SET_DIO_IRQ_PARAMS         = 0x0113   # Configure DIO pin interrupt mapping
+
+    # Radio Configuration Commands
+    _CMD_SET_LORA_SYNC_WORD         = 0x022B   # Set LoRa® sync word (public/private network)
+    _CMD_SET_MODULATION_PARAMS      = 0x020F   # Set SF/BW/CR for LoRa or BR/Fdev for FSK
+    _CMD_SET_PA_CONFIG              = 0x020E   # Configure PA selection and supply (LP/HP/HF)
+    _CMD_SET_PACKET_PARAMS          = 0x0210   # Set packet structure (preamble/header/CRC)
+    _CMD_SET_PACKET_TYPE            = 0x020E   # Select modem (LoRa®/FSK/LR-FHSS)
+    _CMD_SET_RF_FREQUENCY           = 0x0208   # Set operating frequency (150MHz-2.5GHz)
+    _CMD_SET_TX_PARAMS              = 0x020D   # Set TX power level and ramp time
+
+    # Radio Operation Commands
+    _CMD_SET_RX                     = 0x0209   # Start reception (with timeout configuration)
+    _CMD_SET_TX                     = 0x020A   # Start transmission
+    _CMD_SET_RX_TX_FALLBACK_MODE    = 0x0213   # Set post-TX/RX fallback mode (standby/FS)
+
+    # Data Buffer Commands
+    _CMD_READ_BUFFER                = 0x010A   # Read RX buffer content
+    _CMD_WRITE_BUFFER               = 0x0109   # Write payload to TX buffer
+
+    # System Utilities
+    _CMD_GET_RANDOM_NUMBER          = 0x0120   # Generate 32-bit random number
+
+    # Radio Status Commands
+    _CMD_GET_RSSI_INST              = 0x0205   # Get instantaneous RSSI measurement
+    
+    # Standby Mode Options
+    _STANDBY_MODE_INTERNAL_RC_OSCILLATOR = 0x00  # Selects internal RC oscillator (Standby RC mode)
+
+    # Fallback Mode Options
+    _FALLBACK_MODE_STANDBY_RC            = 0x01  # Standby RC mode (default value)
+
+    # IRQ Configuration Constants
+    _CLEAR_IRQ_ALL                       = 0xFFFFFFFF  # Clear all interrupts
+    _IRQ_PARAMS_DIO9_NONE                = 0x00000000  # Disable all interrupts on DIO9
+    _IRQ_PARAMS_DIO11_NONE               = 0x00000000  # Disable all interrupts on DIO11
+
+    # Calibration Parameters
+    _CALIBRATE_ALL                       = 0x3F  # Calibrate all blocks (LF_RC, HF_RC, PLL, ADC, IMG, PLL_TX)
+
+    # Packet Type Constants
+    PACKET_TYPE_NONE                     = 0x00  # No packet type selected
+    PACKET_TYPE_GFSK                     = 0x01  # (G)FSK modulation
+    PACKET_TYPE_LORA                     = 0x02  # LoRa modulation
+    PACKET_TYPE_LR_FHSS                  = 0x04  # LR-FHSS modulation
+    PACKET_TYPE_RFU                      = 0x03  # Reserved for future use
+
+    # LoRa Coding Rate Constants
+    LORA_CR_4_5                          = 0x01  # Short interleaver CR=4/5
+    LORA_CR_4_6                          = 0x02  # Short interleaver CR=4/6
+    LORA_CR_4_7                          = 0x03  # Short interleaver CR=4/7
+    LORA_CR_4_8                          = 0x04  # Short interleaver CR=4/8
+    LORA_CR_LI_4_5                       = 0x05  # Long interleaver CR=4/5
+    LORA_CR_LI_4_6                       = 0x06  # Long interleaver CR=4/6
+    LORA_CR_LI_4_8                       = 0x07  # Long interleaver CR=4/8
+
+    # Hardware Constants
+    _DEVICE_LR1121                       = 0x03  # LR1121 Device ID
+
+    # Timing Constants
+    _BUSY_MAX_DELAY_MS                   = 80   # Maximum delay before BUSY timeout
+    _REBOOT_MAX_DELAY_MS                 = 300  # Maximum delay before reboot timeout
+
 
     def __init__(self, spi, cs_pin, reset_pin, irq_pin=None, busy_pin=None, tcxo_voltage=0):
         """
@@ -119,6 +123,7 @@ class LR1121:
         conflicts with other SPI devices or redundant power consumption.
         """
         logger.info("Closing LR1121 module.")
+        self.busy_pin.irq(None)
         # Deinitialize SPI
         self.spi.deinit()
         
@@ -806,10 +811,10 @@ class LR1121:
             write=True,
             data=data,
             read_length=0,
-            pre_read_length=6  # Expect 6 bytes: Stat1, Stat2, 4-byte IrqStatus
+            pre_read_length=8  # Expect 8 bytes: Stat1, Stat2, 4-byte IrqStatus
         )
         
-        if len(response) < 6:
+        if len(response) < 8:
             raise ValueError("Invalid SetPacketParams response.")
         
         stat1, stat2 = response[0], response[1]
@@ -839,13 +844,13 @@ class LR1121:
             write=True,
             data=data,
             read_length=0,
-            pre_read_length=3  # Stat1, Stat2, 1-byte IrqStatus
+            pre_read_length=6  # Stat1, Stat2, 1-byte IrqStatus
         )
         
-        if len(response) < 3:
+        if len(response) < 6:
             raise ValueError("Invalid SetPaConfig response.")
         
-        stat1, stat2, irq = response[0], response[1], response[2]
+        stat1, stat2, irq = response[0], response[1], response[2:6]
         return (stat1, stat2, irq)
     
     def set_tx_params(self, power=22, ramp_time=0):
@@ -867,13 +872,13 @@ class LR1121:
             write=True,
             data=data,
             read_length=0,
-            pre_read_length=3  # Stat1, Stat2, 1-byte IrqStatus
+            pre_read_length=4  # Stat1, Stat2, 1-byte IrqStatus
         )
         
-        if len(response) < 3:
+        if len(response) < 4:
             raise ValueError("Invalid SetTxParams response.")
         
-        stat1, stat2, irq = response[0], response[1], response[2]
+        stat1, stat2, irq = response[0], response[1], response[2:4]
         return (stat1, stat2, irq)
         
     def get_version(self):
