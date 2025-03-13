@@ -122,16 +122,17 @@ class LR1121:
         This should be called when the module is no longer needed to prevent 
         conflicts with other SPI devices or redundant power consumption.
         """
-        logger.info("Closing LR1121 module.")
         self.busy_pin.irq(None)
         # Deinitialize SPI
         self.spi.deinit()
+        logger.debug("Module is shut down.")
+
         
     def reset(self):
         """
         Reset the LR1121 module and wait until it is ready.
         """
-        logger.info("Resetting LR1121 module...")
+        logger.debug("Resetting LR1121 module...")
         self.reset_pin.value(0)
         time.sleep_ms(10)
         self.reset_pin.value(1)
@@ -244,125 +245,138 @@ class LR1121:
             logger.warning(f"Stat1: FAILURE - {command_status_str}.")
             return False
 
-    def begin(self, frequency, bandwidth, spreading_factor, coding_rate,
-              preamble_length=8, sync_word=0x34):
+    def beginLoraMaxRange(self):
         """
         Initialize the LR1121 module with LoRa settings.
 
         This method resets the module and configures it for LoRa operation with the
         provided parameters.
-
-        :param frequency: Operating frequency in MHz.
-        :param bandwidth: LoRa bandwidth in kHz (valid: 62.5, 125.0, 250.0, 500.0).
-        :param spreading_factor: Spreading factor (integer 5–12).
-        :param coding_rate: Coding rate denominator (integer, e.g. 5 for 4/5, 8 for 4/8).
-        :param preamble_length: Preamble length in symbols.
-        :param sync_word: Sync word (1 byte). Typically 0x34 for public networks.
         """
-        logger.info("Beginning LR1121 initialization...")
-        logger.info("Frequency: %s MHz, Bandwidth: %s kHz, SF: %d, CR: 4/%d.", frequency, bandwidth, spreading_factor, coding_rate)
+        logger.info("Beginning module initialization for max range and power...")
 
         self.reset()
     
-        stat1, *rest = self.get_version()
+        stat1, _, device, *_ = self.get_version()
         is_ok = self.is_stat1_successful(stat1)
         if not is_ok:
              raise ValueError("GetVersion command failed.")
+        if device != self._DEVICE_LR1121:
+            raise ValueError("Not a LR1121 module, invalid device id.")
         
-        stat1, *rest = self.standby()
+        stat1, *_ = self.standby()
         if self.is_stat1_successful(stat1):
-            logger.info("Standby mode successfull.")
+            logger.info("Standby mode set successfully.")
         else:
              raise ValueError("SetStandby command failed.")
     
-        stat1, *rest = self.set_rx_tx_fallback_mode()
+        stat1, *_ = self.set_rx_tx_fallback_mode()
         if self.is_stat1_successful(stat1):
             logger.info("Fallabck mode set successfully.")
         else:
              raise ValueError("SetRxTxFallbackMode command failed.")
     
-        stat1, *rest = self.clear_irq()
+        stat1, *_ = self.clear_irq()
         if self.is_stat1_successful(stat1):
             logger.info("Cleared interrupt signals successfully.")
         else:
              raise ValueError("ClearIrq command failed.")
          
-        stat1, *rest = self.set_dio_irq_params(self._IRQ_PARAMS_DIO9_NONE, self._IRQ_PARAMS_DIO11_NONE)
+        stat1, *_ = self.set_dio_irq_params(self._IRQ_PARAMS_DIO9_NONE, self._IRQ_PARAMS_DIO11_NONE)
         if self.is_stat1_successful(stat1):
             logger.info("All interrupts disabled successfully.")
         else:
-            logger.error("Failed to disable all interrupts.")
+            raise ValueError("Failed to disable all interrupts.")
             
-        stat1, *rest = self.calibrate(self._CALIBRATE_ALL)
+        stat1, *_ = self.calibrate(self._CALIBRATE_ALL)
         if self.is_stat1_successful(stat1):
             logger.info("Calibration successful.")
         else:
-            logger.error("Calibration failed.")
+            raise ValueError("Calibration failed.")
             
         # Get current errors
-        stat1, stat2, error_stat = self.get_errors()
+        stat1, _, error_stat = self.get_errors()
         if self.is_stat1_successful(stat1):
-            logger.info(f"Current error status: 0x{error_stat:04X}")
+            if error_stat != 0:
+                self._log_error_details(error_stat)
+            else:
+                logger.info(f"Current error status: no errors.")
         else:
-            logger.error("Failed to retrieve errors.")
+            ValueError("Failed to retrieve errors.")
 
         # Clear all errors
-        stat1, *rest = self.clear_errors()
+        stat1, *_ = self.clear_errors()
         if self.is_stat1_successful(stat1):
             logger.info("All errors cleared.")
         else:
-            logger.error("Failed to clear errors.")
+            ValueError("Failed to clear errors.")
             
         # Set radio frequency (convert MHz to Hz)
         frequency_mhz = 868
         frequency_hz = int(frequency_mhz * 1e6)
         stat1, *_ = self.set_frequency(frequency_hz)
-        if not self.is_stat1_successful(stat1):
+        if self.is_stat1_successful(stat1):
+            logger.info("Frequency set to %d MHz succesfully.", frequency_mhz)
+        else:
             raise RuntimeError("Failed to set frequency.")
             
         # Example usage of set_packet_type
         # Set packet type to LoRa
-        stat1, *rest = self.set_packet_type(lr.PACKET_TYPE_LORA)
+        stat1, *_ = self.set_packet_type(lr.PACKET_TYPE_LORA)
         if self.is_stat1_successful(stat1):
-            logger.info("Packet type set to LoRa.")
+            logger.info("Packet type set to LoRa succesfully.")
         else:
-            logger.error("Failed to set packet type.")
+            raise RuntimeError("Failed to set packet type.")
             
         # Maximum range configuration for LR1121
-        stat1, *rest = self.set_modulation_params(
+        stat1, *_ = self.set_modulation_params(
             sf=12,                      # Highest spreading factor (SF12)
             bw_khz=62.5,                # Narrowest bandwidth (62.5 kHz)
             cr_code=self.LORA_CR_4_8,   # Strongest error correction (4/8 coding rate)
             ldro=1                      # Enable Low Data Rate Optimization
         )
         if self.is_stat1_successful(stat1):
-            logger.info("Modulation parameters set successfuly.")
+            logger.info("Modulation parameters set succesfully.")
         else:
-            logger.error("Failed to set modulation parameters.")
+            raise RuntimeError("Failed to set modulation parameters.")
             
         # Set packet parameters (max preamble, CRC enabled)
         stat1, *_ = self.set_packet_params(preamble_length=65535, crc_en=1)
-        if not self.is_stat1_successful(stat1):
+        if self.is_stat1_successful(stat1):
+            logger.info("Packet params set succesfully.")
+        else:
             raise RuntimeError("Failed to set packet params.")
         
         # Configure PA for high power
         stat1, *_ = self.set_pa_config(pa_sel=1, pa_duty_cycle=7)
-        if not self.is_stat1_successful(stat1):
+        if self.is_stat1_successful(stat1):
+            logger.info("PA config set succesfully.")
+        else:
             raise RuntimeError("PA config failed.")
         
         # Set TX power to maximum
         stat1, *_ = self.set_tx_params(power=22)
-        if not self.is_stat1_successful(stat1):
+        if self.is_stat1_successful(stat1):
+            logger.info("TX params set succesfully.")
+        else:
             raise RuntimeError("TX params config failed.")
         
-        logger.info("LR1121 configured for max power and range.")
-        return
-
         # Set LoRa sync word
-        self._send_command(self._CMD_SET_LORA_SYNC_WORD, data=bytes([sync_word]))
-        logger.debug("Sync word set to 0x%02X", sync_word)
-
-
+        sync_word = 0x37
+        stat1, *_ = self.set_lora_sync_word(sync_word=0x37)
+        if self.is_stat1_successful(stat1):
+            logger.info(f"LoRa sync word set '0x{sync_word:2X}' succesfully.")
+        else:
+            raise RuntimeError("Sync word config failed.")
+        
+        # Set LoRa sync word
+        stat1, rssi = self.get_rssi()
+        if self.is_stat1_successful(stat1):
+            logger.info("RSSI: %.2f dBm.", rssi)
+        else:
+            raise RuntimeError("RSSI failed.")
+        
+        logger.info("Radio configured for max power and range.")
+        
     def _bandwidth_to_reg(self, bw: float) -> int:
         """
         Convert bandwidth in kHz to BWL register value.
@@ -449,20 +463,17 @@ class LR1121:
 
         :return: RSSI in dBm (float) or None if reading fails.
         """
-        logger.info("Getting RSSI...")
-        response = self._send_command(self._CMD_GET_RSSI_INST, read_length=1)
-        if response:
-            # The LR1121 returns an 8-bit value; see datasheet for conversion (here, divided by -2)
-            raw = int.from_bytes(response, 'big')
-            rssi = raw / -2.0
-            logger.info("RSSI: %.2f dBm", rssi)
-            return rssi
-        else:
-            logger.error("Failed to get RSSI.")
-            return None
+        logger.debug("Getting RSSI...")
+        response = self.spi_command(self._CMD_GET_RSSI_INST, False, b"", 2, 2)
+        stat1 = response[0]
+        # The LR1121 returns an 8-bit value; see datasheet for conversion (here, divided by -2)
+        rssi = response[1] / -2.0
+        logger.debug(f"GetRssiInst command 'Stat1': '0x{stat1:02X}'.")
+                
+        return (stat1, rssi)
         
     def standby(self):
-        logger.info("Calling SetStandby mode command...")
+        logger.debug("Calling SetStandby mode command...")
         response = self.spi_command(self._CMD_MODE_STANDBY, True, self._STANDBY_MODE_INTERNAL_RC_OSCILLATOR.to_bytes(1, "big"), 0, 3)                
         if response is None or len(response) < 3:
             logger.error("Invalid SetStandby response length.")
@@ -478,7 +489,7 @@ class LR1121:
         return (stat1, stat2, irq_status)
     
     def set_rx_tx_fallback_mode(self):
-        logger.info("Calling SetRxTxFallbackMode command...")
+        logger.debug("Calling SetRxTxFallbackMode command...")
         response = self.spi_command(self._CMD_SET_RX_TX_FALLBACK_MODE, True, self._FALLBACK_MODE_STANDBY_RC.to_bytes(1, "big"), 0, 3)                
         if response is None or len(response) < 3:
             logger.error("Invalid SetRxTxFallbackMode response length.")
@@ -494,7 +505,7 @@ class LR1121:
         return (stat1, stat2, irq_status)
     
     def clear_irq(self):
-        logger.info("Calling ClearIrq command...")
+        logger.debug("Calling ClearIrq command...")
         response = self.spi_command(self._CMD_CLEAR_IRQ, True, self._CLEAR_IRQ_ALL.to_bytes(4, "big"), 0, 6)                
         if response is None or len(response) < 6:
             logger.error("Invalid ClearIrq response length.")
@@ -518,7 +529,7 @@ class LR1121:
         :param irq2_to_enable: 32-bit bitmask for enabling interrupts on DIO11.
         :return: A tuple (stat1, stat2, irq_status) if successful, or None if the response is invalid.
         """
-        logger.info("Calling SetDioIrqParams command...")
+        logger.debug("Calling SetDioIrqParams command...")
         
         # Prepare the data bytes: Irq1ToEnable (4 bytes) + Irq2ToEnable (4 bytes)
         data = irq1_to_enable.to_bytes(4, 'big') + irq2_to_enable.to_bytes(4, 'big')
@@ -554,7 +565,7 @@ class LR1121:
             - Bits 6-7: RFU (Reserved for Future Use)
         :return: A tuple (stat1, stat2, irq_status) if successful, or None if the response is invalid.
         """
-        logger.info("Calling Calibrate command...")
+        logger.debug("Calling Calibrate command...")
         
         # Prepare the data byte: CalibParams (1 byte)
         data = calib_params.to_bytes(1, 'big')
@@ -582,7 +593,7 @@ class LR1121:
 
         :return: A tuple (stat1, stat2, error_stat) if successful.
         """
-        logger.info("Calling GetErrors command...")
+        logger.debug("Calling GetErrors command...")
         
         # Send the command and read the response
         response = self.spi_command(self._CMD_GET_ERRORS, False, b"", 3, 2)
@@ -599,10 +610,6 @@ class LR1121:
         logger.debug(f"GetErrors command 'Stat2': '0x{stat2:02X}'.")
         logger.debug(f"GetErrors command 'ErrorStat': '0x{error_stat:04X}'.")
         
-        # Log detailed error information if errors are present
-        if error_stat != 0:
-            self._log_error_details(error_stat)
-        
         return (stat1, stat2, error_stat)
 
     def clear_errors(self):
@@ -611,7 +618,7 @@ class LR1121:
 
         :return: A tuple (stat1, stat2) if successful.
         """
-        logger.info("Calling ClearErrors command.")
+        logger.debug("Calling ClearErrors command...")
         
         # Send the command and read the response
         response = self.spi_command(self._CMD_CLEAR_ERRORS, True, b"", 2, 2)
@@ -646,10 +653,10 @@ class LR1121:
             8: "RX_ADC_OFFSET_ERR: Calibration of ADC offset was not done.",
         }
         
-        logger.debug("Error details:")
+        logger.info("Error details:")
         for bit, message in error_messages.items():
             if error_stat & (1 << bit):
-                logger.debug(f"  - {message}")
+                logger.info(f"  - {message}")
                 
     def set_frequency(self, frequency_hz: int) -> tuple:
         """
@@ -659,7 +666,7 @@ class LR1121:
         :return: Tuple (stat1, stat2, irq_status) from LR1121 response.
         :raises ValueError: If the response is invalid.
         """
-        logger.info("Setting frequency to %d Hz...", frequency_hz)
+        logger.debug("Setting frequency to %d Hz...", frequency_hz)
         
         # Convert frequency to 4-byte big-endian
         data = frequency_hz.to_bytes(4, 'big')
@@ -691,7 +698,7 @@ class LR1121:
         :param packet_type: The packet type to set (use class constants: PACKET_TYPE_*).
         :return: A tuple (stat1, stat2, irq_status) if successful.
         """
-        logger.info("Calling SetPacketType command...")
+        logger.debug("Calling SetPacketType command...")
         
         # Validate the packet type
         valid_packet_types = [
@@ -736,7 +743,7 @@ class LR1121:
         :return: Tuple (stat1, stat2, irq_status) from LR1121 response.
         :raises ValueError: If parameters are invalid.
         """
-        logger.info("Configuring LoRa modulation parameters: SF=%d, BW=%.1f kHz, CR=0x%02X, LDRO=%d.", 
+        logger.debug("Configuring LoRa modulation parameters: SF=%d, BW=%.1f kHz, CR=0x%02X, LDRO=%d...", 
                     sf, bw_khz, cr_code, ldro)
 
         # Validate spreading factor
@@ -797,7 +804,7 @@ class LR1121:
         :param invert_iq: 0 (standard), 1 (inverted).
         :return: Tuple (stat1, stat2, irq_status) from LR1121.
         """
-        logger.info("Setting LoRa packet params: Preamble=%d, CRC=%d", preamble_length, crc_en)
+        logger.debug("Setting LoRa packet params: Preamble=%d, CRC=%d...", preamble_length, crc_en)
         
         # Pack data: [Preamble(2B), HeaderType, PayloadLen, CRC, InvertIQ]
         data = (
@@ -834,7 +841,7 @@ class LR1121:
         :param pa_hp_sel: 0-7 (HP PA size, 7 = max).
         :return: Tuple (stat1, stat2, irq_status).
         """
-        logger.info("Configuring PA...")
+        logger.debug("Configuring PA...")
         
         # Pack data: [PaSel, RegPaSupply, PaDutyCycle, PaHpSel]
         data = bytes([pa_sel, reg_pa_supply, pa_duty_cycle, pa_hp_sel])
@@ -861,7 +868,7 @@ class LR1121:
         :param ramp_time: 0 (fastest) to 7 (slowest).
         :return: Tuple (stat1, stat2, irq_status).
         """
-        logger.info("Setting TX power: %d dBm, ramp=%d.", power, ramp_time)
+        logger.debug("Setting TX power: %d dBm, ramp=%d...", power, ramp_time)
         
         # Power is clipped to 0-22 dBm for HP PA
         power = max(0, min(power, 22))
@@ -880,6 +887,96 @@ class LR1121:
         
         stat1, stat2, irq = response[0], response[1], response[2:4]
         return (stat1, stat2, irq)
+    
+    def set_lora_sync_word(self, sync_word: int) -> tuple:
+        """
+        Set the LoRa sync word for the LR1121.
+
+        The sync word is used to differentiate between public and private LoRa networks.
+        - 0x34: Public LoRaWAN networks.
+        - 0x12: Private LoRa networks.
+        - Custom values may be supported for network isolation.
+
+        :param sync_word: Sync word to set (1 byte, typically 0x34 or 0x12).
+        :return: Tuple (stat1, stat2, irq_status) from LR1121 response.
+        :raises ValueError: If the response is invalid.
+        """
+        logger.debug("Setting LoRa sync word to 0x%02X...", sync_word)
+
+        # Ensure sync word is a single byte
+        if not (0x00 <= sync_word <= 0xFF):
+            raise ValueError(f"Invalid sync word '0x{sync_word:02X}'. Must be a single byte (0x00 - 0xFF).")
+
+        # Convert to byte format
+        data = sync_word.to_bytes(1, 'big')
+
+        # Send command and read response (Stat1, Stat2, IrqStatus)
+        response = self.spi_command(
+            cmd=self._CMD_SET_LORA_SYNC_WORD,
+            write=True,
+            data=data,
+            read_length=0,
+            pre_read_length=3  # Expect 3 bytes: Stat1, Stat2, IrqStatus
+        )
+
+        if len(response) < 3:
+            logger.error("Invalid response length for SetLoraSyncWord.")
+            raise ValueError("Invalid SetLoraSyncWord response.")
+
+        stat1 = response[0]
+        stat2 = response[1]
+        irq_status = response[2]
+
+        logger.debug(f"SetLoraSyncWord command 'Stat1': '0x{stat1:02X}'.")
+        logger.debug(f"SetLoraSyncWord command 'Stat2': '0x{stat2:02X}'.")
+        logger.debug(f"SetLoraSyncWord command 'IrqStatus': '0x{irq_status:02X}'.")
+
+        return (stat1, stat2, irq_status)
+    
+    def set_lora_sync_word(self, sync_word: int) -> tuple:
+        """
+        Set the LoRa sync word for the LR1121.
+
+        The sync word is used to differentiate between public and private LoRa networks.
+        - 0x34: Public LoRaWAN networks.
+        - 0x12: Private LoRa networks.
+        - Custom values may be supported for network isolation.
+
+        :param sync_word: Sync word to set (1 byte, typically 0x34 or 0x12).
+        :return: Tuple (stat1, stat2, irq_status) from LR1121 response.
+        :raises ValueError: If the response is invalid.
+        """
+        logger.debug("Setting LoRa sync word to 0x%02X...", sync_word)
+
+        # Ensure sync word is a single byte
+        if not (0x00 <= sync_word <= 0xFF):
+            raise ValueError(f"Invalid sync word '0x{sync_word:02X}'. Must be a single byte (0x00 - 0xFF).")
+
+        # Convert to byte format
+        data = sync_word.to_bytes(1, 'big')
+
+        # Send command and read response (Stat1, Stat2, IrqStatus)
+        response = self.spi_command(
+            cmd=self._CMD_SET_LORA_SYNC_WORD,
+            write=True,
+            data=data,
+            read_length=0,
+            pre_read_length=3  # Expect 3 bytes: Stat1, Stat2, IrqStatus
+        )
+
+        if len(response) < 3:
+            logger.error("Invalid response length for SetLoraSyncWord.")
+            raise ValueError("Invalid SetLoraSyncWord response.")
+
+        stat1 = response[0]
+        stat2 = response[1]
+        irq_status = response[2]
+
+        logger.debug(f"SetLoraSyncWord command 'Stat1': '0x{stat1:02X}'.")
+        logger.debug(f"SetLoraSyncWord command 'Stat2': '0x{stat2:02X}'.")
+        logger.debug(f"SetLoraSyncWord command 'IrqStatus': '0x{irq_status:02X}'.")
+
+        return (stat1, stat2, irq_status)
         
     def get_version(self):
         """
@@ -893,7 +990,7 @@ class LR1121:
 
         :return: A tuple (hardware, device, fw_major, fw_minor) if successful, or None if no valid response.
         """
-        logger.info("Calling GetVersion info command...")
+        logger.debug("Calling GetVersion info command...")
         response = self.spi_command(self._CMD_GET_VERSION, False, b"", 5, 2)                
         if response is None or len(response) < 5:
             logger.error("Invalid GetVersion response length.")
@@ -963,9 +1060,7 @@ if __name__ == "__main__":
         # Create an LR1121 instance
         lr = LR1121(spi, cs, rst, irq_pin=irq, busy_pin=busy)
 
-        # Initialize the module for LoRa operation:
-        # Frequency: 915 MHz, Bandwidth: 125 kHz, SF: 7, CR: 4/5, default preamble, public sync word (0x34)
-        lr.begin(frequency=868, bandwidth=125.0, spreading_factor=12, coding_rate=8)
+        lr.beginLoraMaxRange()
 
         # # Transmit a simple message
         # message = b'Hello LR1121!'
