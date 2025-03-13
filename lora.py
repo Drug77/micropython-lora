@@ -58,8 +58,6 @@ class LR1121:
 
     # IRQ Configuration Constants
     _CLEAR_IRQ_ALL                       = 0xFFFFFFFF  # Clear all interrupts
-    _IRQ_PARAMS_DIO9_NONE                = 0x00000000  # Disable all interrupts on DIO9
-    _IRQ_PARAMS_DIO11_NONE               = 0x00000000  # Disable all interrupts on DIO11
 
     # Calibration Parameters
     _CALIBRATE_ALL                       = 0x3F  # Calibrate all blocks (LF_RC, HF_RC, PLL, ADC, IMG, PLL_TX)
@@ -86,9 +84,31 @@ class LR1121:
     # Timing Constants
     _BUSY_MAX_DELAY_MS                   = 80   # Maximum delay before BUSY timeout
     _REBOOT_MAX_DELAY_MS                 = 300  # Maximum delay before reboot timeout
+    
+    # IRQ flags - Used for configuring interrupts on DIO9/DIO11
+    IRQ_TX_DONE                = 1 << 0   # Bit 0: TX completed
+    IRQ_RX_DONE                = 1 << 1   # Bit 1: RX completed
+    IRQ_SYNC_WORD_VALID        = 1 << 2   # Bit 2: Sync word detected
+    IRQ_HEADER_VALID           = 1 << 3   # Bit 3: Header received & valid
+    IRQ_HEADER_ERROR           = 1 << 4   # Bit 4: Header CRC error
+    IRQ_CRC_ERROR              = 1 << 5   # Bit 5: Payload CRC error
+    IRQ_CAD_DONE               = 1 << 6   # Bit 6: Channel activity detection completed
+    IRQ_CAD_DETECTED           = 1 << 7   # Bit 7: CAD detected a valid signal
+    IRQ_TIMEOUT                = 1 << 8   # Bit 8: RX or TX timeout
+    IRQ_LR_FHSS_HOP            = 1 << 9   # Bit 9: LR-FHSS hop occurred
+    IRQ_RESERVED               = 1 << 10  # Bit 10: Reserved bit (keep unset)
+    IRQ_PREAMBLE_DETECTED      = 1 << 11  # Bit 11: Preamble detected
+    IRQ_RX_TX_TIMEOUT          = 1 << 12  # Bit 12: RX/TX timeout (alias for IRQ_TIMEOUT)
+    IRQ_RFU_13                 = 1 << 13  # Bit 13: Reserved for future use (RFU)
+    IRQ_RFU_14                 = 1 << 14  # Bit 14: Reserved for future use (RFU)
+    IRQ_RFU_15                 = 1 << 15  # Bit 15: Reserved for future use (RFU)
+    IRQ_ALL                    = 0xFFFFFFFF  # All IRQs enabled (Bitmask 0xFFFF_FFFF)
 
+    # Default IRQ parameter values to disable all interrupts
+    IRQ_PARAMS_DIO9_NONE       = 0x00000000  # Disable all interrupts on DIO9
+    IRQ_PARAMS_DIO11_NONE      = 0x00000000  # Disable all interrupts on DIO11
 
-    def __init__(self, spi, cs_pin, reset_pin, irq_pin=None, busy_pin=None, tcxo_voltage=0):
+    def __init__(self, spi, cs_pin, reset_pin, irq_pin, busy_pin):
         """
         Initialize an instance of LR1121.
 
@@ -99,9 +119,13 @@ class LR1121:
         self.spi = spi
         self.cs = cs_pin
         self.reset_pin = reset_pin
+        self.irq_pin = irq_pin
         self.busy_pin = busy_pin
-        self.tcxo_voltage = tcxo_voltage
+        
+        # Attach the BUSY handler
         self.busy_pin.irq(self.busy_handler, machine.Pin.IRQ_FALLING | machine.Pin.IRQ_RISING)
+        # Attach the IRQ handler
+        self.irq_pin.irq(self.irq_handler, machine.Pin.IRQ_FALLING)
         self.is_busy = False
 
         # Internal configuration state
@@ -109,9 +133,30 @@ class LR1121:
         self.bandwidth = None
         self.spreading_factor = None
         self.coding_rate = None
+        self.sync_word = None
 
     def busy_handler(self, busy_pin):
         self.is_busy = busy_pin.value() == 1
+        
+    def irq_handler(pin):
+        """
+        Interrupt handler for LR1121 IRQ pin.
+        This function is executed when an interrupt occurs on DIO9.
+        """
+        logger.info("Interrupt triggered on DIO9!")
+
+        # Read and clear interrupts
+        _, _, irq_status = lr.clear_irq()
+
+        # Check what triggered the interrupt
+        if irq_status[0] & lr.IRQ_TX_DONE:
+            logger.info("TX_DONE interrupt received.")
+        if irq_status[0] & lr.IRQ_RX_DONE:
+            logger.info("RX_DONE interrupt received.")
+        if irq_status[0] & lr.IRQ_TIMEOUT:
+            logger.warning("TIMEOUT interrupt received.")
+        if irq_status[0] & lr.IRQ_CRC_ERROR:
+            logger.error("CRC_ERROR interrupt received.")
         
     def close(self):
         """
@@ -125,7 +170,7 @@ class LR1121:
         self.busy_pin.irq(None)
         # Deinitialize SPI
         self.spi.deinit()
-        logger.debug("Module is shut down.")
+        logger.info("Module shut down successfully.")
 
         
     def reset(self):
@@ -281,7 +326,7 @@ class LR1121:
         else:
              raise ValueError("ClearIrq command failed.")
          
-        stat1, *_ = self.set_dio_irq_params(self._IRQ_PARAMS_DIO9_NONE, self._IRQ_PARAMS_DIO11_NONE)
+        stat1, *_ = self.set_dio_irq_params(self.IRQ_PARAMS_DIO9_NONE, self.IRQ_PARAMS_DIO11_NONE)
         if self.is_stat1_successful(stat1):
             logger.info("All interrupts disabled successfully.")
         else:
@@ -376,52 +421,75 @@ class LR1121:
             raise RuntimeError("RSSI failed.")
         
         logger.info("Radio configured for max power and range.")
-        
-    def _bandwidth_to_reg(self, bw: float) -> int:
-        """
-        Convert bandwidth in kHz to BWL register value.
 
-        :param bw: Bandwidth in kHz (62.5, 125, 250, 500).
-        :return: Register value (0x03, 0x04, 0x05, 0x06).
-        :raises ValueError: For invalid bandwidth.
+    def transmit(self, data: bytes, timeout_ms: int = 5000) -> bool:
         """
-        bw_map = {
-            62.5: 0x03,
-            125.0: 0x04,
-            250.0: 0x05,
-            500.0: 0x06
-        }
-        
-        # Allow slight floating point tolerance
-        for valid_bw, reg in bw_map.items():
-            if abs(bw - valid_bw) < 0.1:
-                return reg
-    
-        raise ValueError(f"Invalid LoRa bandwidth '{bw:.1f}' kHz. Valid values: 62.5, 125, 250, 500.")
+        Transmit a payload via LR1121 in LoRa mode, using IRQ for TX_DONE or TIMEOUT.
 
-    def transmit(self, data):
-        """
-        Transmit a payload via LR1121 in LoRa mode.
-
-        This method writes the payload to the radio buffer and initiates transmission.
-        Note: This is a blocking call that waits for the transmission to complete.
+        This function:
+        - Writes the data to the radio buffer.
+        - Configures the IRQ for TX_DONE and TIMEOUT.
+        - Starts transmission.
+        - Waits for the IRQ pin to trigger.
+        - Checks if transmission was successful.
 
         :param data: A bytes object containing the payload.
+        :param timeout_ms: Timeout in milliseconds for transmission.
+        :return: True if TX was successful, False if timeout occurred.
         """
-        logger.info("Transmitting data: %s", data)
-        # Write data to TX buffer
-        self._send_command(self._CMD_WRITE_BUFFER, data=data)
+        logger.info("Transmitting data: '%s'...", data)
+
+        # 1️⃣ Write data to TX buffer
+        stat1, *_ = self.spi_command(self._CMD_WRITE_BUFFER, True, data, 0, 2 + len(data))
+        if not self.is_stat1_successful(stat1):
+            logger.error("Failed to write data to TX buffer.")
+            return False
         logger.debug("Data written to TX buffer.")
 
-        # Start transmission with no timeout (0x000000 means "no timeout")
+        # 2️⃣ Configure IRQ for TX_DONE and TIMEOUT
+        stat1, *_ = self.set_dio_irq_params(self.IRQ_PARAMS_DIO9_NONE, self.IRQ_TX_DONE | self.IRQ_TIMEOUT)
+        if not self.is_stat1_successful(stat1):
+            logger.error("Failed to configure IRQ for TX_DONE and TIMEOUT.")
+            return False
+        logger.debug("IRQ set for TX_DONE and TIMEOUT.")
+
+        # 3️⃣ Start transmission with no timeout (0x000000 means "no timeout")
         tx_timeout = (0).to_bytes(3, 'big')
-        self._send_command(self._CMD_SET_TX, data=tx_timeout)
+        stat1, *_ = self.spi_command(self._CMD_SET_TX, True, tx_timeout, 0, 5)
+        if not self.is_stat1_successful(stat1):
+            logger.error("Failed to start transmission.")
+            return False
         logger.info("Transmission started.")
 
-        # In a real implementation you would wait for an IRQ or poll a status register.
-        # Here we simply wait a fixed time.
-        time.sleep_ms(100)
-        logger.info("Transmission complete.")
+        # 4️⃣ Wait for TX_DONE or TIMEOUT IRQ
+        start_time = time.ticks_ms()
+        while True:
+            if self.irq_pin.value() == 1:  # IRQ pin is active
+                break
+            if time.ticks_diff(time.ticks_ms(), start_time) > timeout_ms:
+                logger.warning("Transmission timeout!")
+                return False
+            time.sleep_ms(10)
+
+        # 5️⃣ Read and clear IRQ status
+        stat1, _, irq_status = self.clear_irq()
+        irq_status = int.from_bytes(irq_status, 'big')  # Convert bytes to int
+        # TODO: Handle debug level
+        self._log_irq_status(irq_status)
+        if not self.is_stat1_successful(stat1):
+            logger.error("Failed to clear IRQ after TX.")
+            return False
+
+        # 6️⃣ Check if TX was successful
+        if irq_status[0] & self.IRQ_TX_DONE:
+            logger.info("TX successful (TX_DONE IRQ).")
+            return True
+        elif irq_status[0] & self.IRQ_TIMEOUT:
+            logger.warning("TX failed (TIMEOUT IRQ).")
+            return False
+        else:
+            logger.error("Unexpected IRQ status after TX: 0x%02X", irq_status[0])
+            return False
 
     def receive(self, timeout_ms=1000):
         """
@@ -634,29 +702,6 @@ class LR1121:
         logger.debug(f"ClearErrors command 'Stat2': '0x{stat2:02X}'.")
         
         return (stat1, stat2)
-
-    def _log_error_details(self, error_stat):
-        """
-        Log detailed information about the errors in the ErrorStat byte.
-
-        :param error_stat: The 16-bit error status byte.
-        """
-        error_messages = {
-            0: "LF_RC_CALIB_ERR: Calibration of low frequency RC was not done.",
-            1: "HF_RC_CALIB_ERR: Calibration of high frequency RC was not done.",
-            2: "ADC_CALIB_ERR: Calibration of ADC was not done.",
-            3: "PLL_CALIB_ERR: Calibration of maximum and minimum frequencies was not done.",
-            4: "IMG_CALIB_ERR: Calibration of the image rejection was not done.",
-            5: "HF_XOSC_START_ERR: High frequency XOSC did not start correctly.",
-            6: "LF_XOSC_START_ERR: Low frequency XOSC did not start correctly.",
-            7: "PLL_LOCK_ERR: The PLL did not lock.",
-            8: "RX_ADC_OFFSET_ERR: Calibration of ADC offset was not done.",
-        }
-        
-        logger.info("Error details:")
-        for bit, message in error_messages.items():
-            if error_stat & (1 << bit):
-                logger.info(f"  - {message}")
                 
     def set_frequency(self, frequency_hz: int) -> tuple:
         """
@@ -1037,13 +1082,98 @@ class LR1121:
         logger.info(f"Random number: '{rand_val}'.")
         
         return rand_val
+    
+    def _log_error_details(self, error_stat):
+        """
+        Log detailed information about the errors in the ErrorStat byte.
+
+        :param error_stat: The 16-bit error status byte.
+        """
+        error_messages = {
+            0: "LF_RC_CALIB_ERR: Calibration of low frequency RC was not done.",
+            1: "HF_RC_CALIB_ERR: Calibration of high frequency RC was not done.",
+            2: "ADC_CALIB_ERR: Calibration of ADC was not done.",
+            3: "PLL_CALIB_ERR: Calibration of maximum and minimum frequencies was not done.",
+            4: "IMG_CALIB_ERR: Calibration of the image rejection was not done.",
+            5: "HF_XOSC_START_ERR: High frequency XOSC did not start correctly.",
+            6: "LF_XOSC_START_ERR: Low frequency XOSC did not start correctly.",
+            7: "PLL_LOCK_ERR: The PLL did not lock.",
+            8: "RX_ADC_OFFSET_ERR: Calibration of ADC offset was not done.",
+        }
+        
+        logger.info("Error details:")
+        for bit, message in error_messages.items():
+            if error_stat & (1 << bit):
+                logger.info(f"  - {message}")
+                
+    def _bandwidth_to_reg(self, bw: float) -> int:
+        """
+        Convert bandwidth in kHz to BWL register value.
+
+        :param bw: Bandwidth in kHz (62.5, 125, 250, 500).
+        :return: Register value (0x03, 0x04, 0x05, 0x06).
+        :raises ValueError: For invalid bandwidth.
+        """
+        bw_map = {
+            62.5: 0x03,
+            125.0: 0x04,
+            250.0: 0x05,
+            500.0: 0x06
+        }
+        
+        # Allow slight floating point tolerance
+        for valid_bw, reg in bw_map.items():
+            if abs(bw - valid_bw) < 0.1:
+                return reg
+    
+        raise ValueError(f"Invalid LoRa bandwidth '{bw:.1f}' kHz. Valid values: 62.5, 125, 250, 500.")
+    
+    def _log_irq_status(self, irq_status: int):
+        """
+        Log detailed information about the interrupt (IRQ) status from the LR1121.
+
+        The IRQ status is a 32-bit bitmask, where each bit represents a specific interrupt event.
+
+        :param irq_status: The 32-bit IRQ status value.
+        """
+        irq_messages = {
+            0:  "TX_DONE: Transmission completed successfully.",
+            1:  "RX_DONE: Packet received successfully.",
+            2:  "PREAMBLE_DETECTED: Preamble was detected.",
+            3:  "SYNC_WORD_VALID: Valid sync word detected.",
+            4:  "HEADER_VALID: Valid LoRa header detected.",
+            5:  "HEADER_ERROR: CRC error in header (LoRa).",
+            6:  "CRC_ERROR: CRC error in payload.",
+            7:  "CAD_DONE: Channel Activity Detection (CAD) completed.",
+            8:  "CAD_DETECTED: CAD detected a signal.",
+            9:  "RX_TX_TIMEOUT: RX/TX timeout occurred.",
+            10: "FREQ_LOCKED: Frequency locked successfully.",
+            11: "PLL_UNLOCK: PLL unlock detected (error).",
+            12: "PA_RAMP_DONE: PA ramp-up completed.",
+            13: "VALID_TIMESTAMP: Valid timestamp detected (for ranging).",
+            14: "RANGING_DONE: Ranging procedure completed.",
+            15: "RANGING_SLAVE_RESPONSE: Ranging slave responded.",
+            16: "RANGING_MASTER_REQUEST_DISCARDED: Ranging master request discarded.",
+            17: "RANGING_SLAVE_REQUEST_DISCARDED: Ranging slave request discarded.",
+            18: "RANGING_REQUEST_TIMEOUT: No ranging request received within timeout.",
+            19: "RANGING_RESULT_VALID: Ranging result is valid.",
+            20: "RANGING_TIMEOUT: Ranging procedure timed out.",
+        }
+
+        logger.info("IRQ Status Details:")
+        for bit, message in irq_messages.items():
+            if irq_status & (1 << bit):
+                logger.info(f"  - {message}")
+
+        if irq_status == 0:
+            logger.info("  - No active IRQs.")
 
 # ===== Example usage =====
 if __name__ == "__main__":
     from config import RADIO_CS_PIN, RADIO_RST_PIN, RADIO_BUSY_PIN, RADIO_DIO_PIN, RADIO_MOSI_PIN, RADIO_MISO_PIN, RADIO_SCK_PIN
     
     # Configure module logger
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.DEBUG)
     
     try:
         # Example hardware configuration (adjust pins and SPI settings to your board)
@@ -1058,13 +1188,13 @@ if __name__ == "__main__":
         spi.init()
 
         # Create an LR1121 instance
-        lr = LR1121(spi, cs, rst, irq_pin=irq, busy_pin=busy)
+        lr = LR1121(spi, cs, rst, irq, busy)
 
         lr.beginLoraMaxRange()
 
         # # Transmit a simple message
-        # message = b'Hello LR1121!'
-        # lr.transmit(message)
+        message = b'Hello LR1121!'
+        lr.transmit(message)
 
         # # Try to receive a message (with 1000 ms timeout)
         # received = lr.receive(timeout_ms=1000)
@@ -1080,4 +1210,19 @@ if __name__ == "__main__":
             
         #lr.get_random_number()
     finally:
+        # Get current errors
+        stat1, _, error_stat = lr.get_errors()
+        if lr.is_stat1_successful(stat1):
+            if error_stat != 0:
+                lr._log_error_details(error_stat)
+            else:
+                logger.info(f"Current error status: no errors.")
+        else:
+            ValueError("Failed to retrieve errors.")
+            
+        stat1, _, irq_status = lr.clear_irq()
+        irq_status = int.from_bytes(irq_status, 'big')  # Convert bytes to int
+        # TODO: Handle debug level
+        lr._log_irq_status(irq_status)
+        
         lr.close()
