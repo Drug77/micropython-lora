@@ -1,185 +1,475 @@
-import machine
 import time
+import struct
+from machine import Pin, SPI
+import ujson
+import micropython
 import logging
-from config import RADIO_CS_PIN, RADIO_BUSY_PIN, RADIO_RST_PIN, RADIO_DIO_PIN, LED_PIN
 
 
-# Configure logging
-logging.basicConfig(level=logging.DEBUG)
-logger = logging.getLogger("RADIO")
-logger.setLevel(logging.DEBUG)
+micropython.alloc_emergency_exception_buf(256)
 
+logger = logging.getLogger("LR1121")
+
+# ==============================================================================
+# LR1121 Constants and Opcodes (Semtech LR1121 UM Rev 1.2)
+# ==============================================================================
+
+LR1121_SPI_BAUDRATE = 2_000_000
+
+# ---- System
+LR1121_OP_GET_STATUS     = 0x0100  # GetStatus (returns Stat1, Stat2, IrqStatus[31:0])
+LR1121_OP_SET_TCXO       = 0x0117  # SetTcxoMode
+LR1121_OP_CALIBRATE      = 0x010F  # Calibrate
+LR1121_OP_GET_ERROR      = 0x010D  # GetErrors
+LR1121_OP_CLR_ERROR      = 0x010E  # ClearErrors
+LR1121_OP_SET_REG        = 0x0110  # SetRegMode
+LR1121_OP_SET_STDBY      = 0x011C  # SetStandby
+LR1121_OP_SET_DIO_IRQ    = 0x0113  # SetDioIrqParams
+LR1121_OP_CLR_IRQ        = 0x0114  # ClearIrqStatus
+LR1121_OP_WRITE_BUFFER8  = 0x0109  # WriteBuffer8
+
+# ---- Radio
+LR1121_OP_SET_FREQ       = 0x0206  # SetRfFrequency
+LR1121_OP_SET_TX         = 0x020A  # SetTx
+
+# ---- LoRa/GFSK/LR-FHSS config (minimal LoRa TX)
+LR1121_OP_SET_PACKET_TYPE        = 0x020E  # SetPacketType
+LR1121_OP_SET_MODULATION_PARAMS  = 0x020F  # SetModulationParams
+LR1121_OP_SET_PACKET_PARAMS      = 0x0210  # SetPacketParams
+LR1121_OP_SET_TX_PARAMS          = 0x0211  # SetTxParams
+LR1121_OP_SET_PA_CONFIG          = 0x0215  # SetPaConfig
+LR1121_OP_SET_LORA_SYNC_WORD     = 0x022B  # SetLoRaSyncWord
+
+# ---- Packet types
+PACKET_TYPE_LORA = 0x02
+
+# ---- Standby modes
+STDBY_RC   = 0x00
+STDBY_XOSC = 0x01
+
+# ---- Calibration mask (all blocks)
+CALIB_ALL_MASK = 0x3F
+
+# ---- TCXO voltage codes
+TCXO_VOLTAGE_1_8V = 0x02
+TCXO_VOLTAGE_3_3V = 0x07
+
+# ---- IRQ bits (commonly used mapping)
+IRQ_TX_DONE   = 1 << 2
+IRQ_TIMEOUT   = 1 << 10
+IRQ_CMD_ERROR = 1 << 22
+IRQ_ERROR     = 1 << 23
+
+IRQ_ALL = 0xFFFFFFFF
+
+# ==============================================================================
+# LR1121 Driver Class
+# ==============================================================================
 class LR1121:
-    def __init__(self, spi, cs_pin, busy_pin, reset_pin, dio_pin, led_pin):
+    def __init__(self, spi_bus, nss_pin, busy_pin, rst_pin, dio9_pin):
+        self.spi = spi_bus
+        self.nss = nss_pin
+        self.busy = busy_pin
+        self.rst = rst_pin
+        self.dio9 = dio9_pin
+        self.dio9_triggered = False
+
+        self.nss.init(Pin.OUT, value=1)
+        self.rst.init(Pin.OUT, value=1)
+        self.busy.init(Pin.IN)
+
+        self.dio9.init(Pin.IN, Pin.PULL_DOWN)
+        self.dio9.irq(self._dio9_irq, trigger=Pin.IRQ_RISING)
+
+        logger.info("LR1121 driver Initialized.")
+
+
+    def _dio9_irq(self, _pin):
+        self.dio9_triggered = True
+
+    def _dio9_clear_trigger(self):
+        self.dio9_triggered = False
+
+    def _wait_busy(self, timeout_ms=2000):
+        start_time = time.ticks_ms()
+        while self.busy.value() == 1:
+            if time.ticks_diff(time.ticks_ms(), start_time) > timeout_ms:
+                raise OSError("Hardware Timeout: BUSY stuck HIGH.")
+
+    def send_command(self, opcode, data=b''):
+        self._wait_busy()
+        self.nss.value(0)
+        self.spi.write(struct.pack('>H', opcode))
+        if data:
+            self.spi.write(data)
+        self.nss.value(1)
+        # next call will wait BUSY
+
+    def read_command(self, opcode, read_len):
         """
-        Initialize the LR1121 LoRa transceiver.
-        :param spi: The SPI bus object
-        :param cs_pin: Chip select pin (NSS)
-        :param busy_pin: Busy pin
-        :param reset_pin: Reset pin
-        :param dio_pin: DIO pin
+        Classic: send opcode (write phase), wait busy, then read read_len bytes
         """
-        self.spi = spi
-        self.cs = machine.Pin(cs_pin, machine.Pin.OUT, value=1)
-        self.busy = machine.Pin(busy_pin, machine.Pin.IN)
-        self.reset = machine.Pin(reset_pin, machine.Pin.OUT, value=1)
-        self.dio_pin = machine.Pin(dio_pin, machine.Pin.IN)
-        self.led_pin = machine.Pin(led_pin, machine.Pin.OUT, value=0)
+        self._wait_busy()
+        self.nss.value(0)
+        self.spi.write(struct.pack('>H', opcode))
+        self.nss.value(1)
 
-        logger.info("LR1121 initialized.")
+        self._wait_busy()
 
-    def reset_device(self):
-        """Perform a hardware reset of the LR1121."""
-        logger.info("Resetting LR1121...")
-        self.reset.value(0)
-        time.sleep(0.01)
-        self.reset.value(1)
-        time.sleep(0.01)
-        logger.debug("Reset complete.")
+        self.nss.value(0)
+        resp = self.spi.read(read_len)
+        self.nss.value(1)
+        return resp
 
-    def wait_busy(self):
-        """Wait until the LR1121 is ready to accept a command."""
-        logger.debug("Waiting for BUSY to clear...")
-        # Enable onboard led to indicate radio is busy 
-        self.led_pin.value(1)
-        while self.busy.value():
-            time.sleep(0.001)
-        # Disable onboard led to indicate radio is done 
-        self.led_pin.value(0)
-        logger.debug("BUSY cleared.")
+    # --------------------------------------------------------------------------
+    # Basics
+    # --------------------------------------------------------------------------
+    def hardware_reset(self):
+        logger.warning("Resetting...")
+        self.rst.value(0)
+        time.sleep_ms(2)
+        self.rst.value(1)
+        time.sleep_ms(10)
+        self._wait_busy()
+        logger.info("Reset Complete.")
 
-    def send_command(self, command, data=[]):
+    def get_status(self):
+        # Stat1, Stat2, Irq[31:24], Irq[23:16], Irq[15:8], Irq[7:0]
+        resp = self.read_command(LR1121_OP_GET_STATUS, 6)
+        stat1, stat2 = resp[0], resp[1]
+        irq = int.from_bytes(resp[2:6], "big")
+        logger.debug(f"GetStatus: Stat1=0b{stat1:08b} Stat2=0b{stat2:08b} IrqStatus=0b{irq:08b}.")
+        return stat1, stat2, irq
+
+    def clear_irq(self, mask=IRQ_ALL):
+        payload = mask.to_bytes(4, "big")
+        self.send_command(LR1121_OP_CLR_IRQ, payload)
+        logger.debug("ClearIrq command sent.")
+
+    def set_dio_irq_params(self, dio9_mask, dio11_mask=0):
+        payload = dio9_mask.to_bytes(4, "big") + dio11_mask.to_bytes(4, "big")
+        self.send_command(LR1121_OP_SET_DIO_IRQ, payload)
+        logger.debug("SetDioIrqParams command sent.")
+
+    def get_errors(self):
+        resp = self.read_command(LR1121_OP_GET_ERROR, 4)
+        stat1 = resp[0]
+        err = (resp[2] << 8) | resp[3]
+        logger.debug(f"GetErrors: Stat1=0b{stat1:08b} Errors=0b{err:016b}.")
+        return err
+
+    def configure_tcxo(self, voltage=TCXO_VOLTAGE_1_8V, delay_ms=10):
+        logger.debug(f"Configuring TCXO: {delay_ms}ms delay, Voltage Code {voltage}.")
+        steps = int(delay_ms * 32.76)  # per UM (~30.52us steps)
+        delay_bytes = struct.pack('>I', steps)[1:]  # 24-bit
+        payload = struct.pack('B', voltage) + delay_bytes
+        self.send_command(LR1121_OP_SET_TCXO, payload)
+        logger.debug("SetTcxoMode command sent.")
+
+    def set_regulator_ldo(self):
+        self.send_command(LR1121_OP_SET_REG, b"\x00")
+        logger.debug("SetRegMode LDO command sent.")
+
+    def standby(self, mode=STDBY_RC):
+        self.send_command(LR1121_OP_SET_STDBY, bytes([mode]))
+        logger.debug("SetStandby command sent.")
+
+    def set_rf_frequency(self, freq_hz):
+        logger.info(f"Setting Frequency to {freq_hz} Hz.")
+        payload = struct.pack('>I', freq_hz)
+        self.send_command(LR1121_OP_SET_FREQ, payload)
+        logger.debug("SetRfFrequency command sent.")
+    
+    def calibrate_system(self):
+        logger.info("Starting Calibration...")
+        self.send_command(LR1121_OP_CALIBRATE, struct.pack('B', CALIB_ALL_MASK))
+        self._wait_busy(timeout_ms=2000)
+
+        errors = self.get_errors()
+        if errors == 0:
+            logger.info("Calibration Successful.")
+        else:
+            logger.error(f"Calibration Failed! Error Code: 0b{errors:016b}")
+        return errors
+    
+    def is_stat1_successful(self, stat1):
         """
-        Send a command to the LR1121 over SPI.
-        :param command: Command byte
-        :param data: List of data bytes
+        Check if Stat1 response indicates a successful command execution.
+
+        :param stat1: The Stat1 byte received from LR1121.
+        :return: True if the command was successful (CMD_OK or CMD_DAT), False otherwise.
         """
-        self.wait_busy()
-        self.cs.value(0)
-        self.spi.write(bytes([command] + data))
-        self.cs.value(1)
-        logger.debug("Sent command 0x%02X with data %s", command, data)
-        self.wait_busy()
+        command_status = (stat1 >> 1) & 0b111  # Extract bits 3:1
+        interrupt_status = stat1 & 0b1         # Extract bit 0
 
-    def receive_data(self, length):
-        """
-        Receive data from the LR1121.
-        :param length: Number of bytes to read
-        :return: Received data as bytes
-        """
-        self.wait_busy()
-        self.cs.value(0)
-        self.spi.write(bytes([0x01, 0x07, length]))
-        response = self.spi.read(length)
-        self.cs.value(1)
-        logger.info("Received data: %s", response)
-        return response
-
-    def send_packet(self, data):
-        """Send a packet over LoRa."""
-        logger.info("Sending packet: %s", data)
-        self.send_command(0x01, [0x0E] + list(data))
-        logger.debug("Packet sent.")
-
-    def receive_packet(self, length):
-        """Receive a packet over LoRa."""
-        logger.info("Receiving packet...")
-        return self.receive_data(length)
-
-    def set_rf_frequency(self, frequency):
-        """Set the RF frequency."""
-        freq_bytes = frequency.to_bytes(4, "big")
-        self.send_command(0x86, list(freq_bytes))
-        logger.info("RF frequency set to %d Hz", frequency)
-
-    def set_lora_modulation(self, spreading_factor, bandwidth, coding_rate):
-        """Set LoRa modulation parameters."""
-        self.send_command(0x8A, [spreading_factor, bandwidth, coding_rate])
-        logger.info("LoRa modulation set: SF=%d, BW=%dkHz, CR=%d", spreading_factor, bandwidth, coding_rate)
-
-    def set_output_power(self, power):
-        """Set output power (max 22 dBm)."""
-        if power > 22:
-            power = 22
-        self.send_command(0x8E, [power])
-        logger.info("Output power set to %d dBm", power)
-
-    def set_sync_word(self, sync_word):
-        """Set sync word for LoRa (Public: 0x34, Private: 0x12)."""
-        self.send_command(0x8C, [sync_word])
-        logger.info("Sync word set to 0x%02X", sync_word)
-
-    def enable_crc(self, enable):
-        """Enable or disable CRC."""
-        self.send_command(0x8B, [1 if enable else 0])
-        logger.info("CRC %s", "enabled" if enable else "disabled")
-
-    def set_max_range_mode(self):
-        """Configure settings for maximum range and lowest speed."""
-        logger.info("Configuring for max range and lowest speed.")
-        self.set_rf_frequency(868000000)  # Set frequency to 868MHz
-        self.set_lora_modulation(12, 125, 8)  # SF=12, BW=125kHz, CR=4/8
-        self.set_output_power(22)  # Max output power
-        self.set_sync_word(0x34)  # Public LoRaWAN sync word
-        self.enable_crc(True)
-        logger.info("Max range mode configured.")
-        
-    def set_2_4ghz_mode(self):
-        """Configure settings for 2.4 GHz LoRa mode."""
-        logger.info("Configuring for 2.4 GHz LoRa mode.")
-        # Set frequency to 2450 MHz (2.45 GHz)
-        self.set_rf_frequency(2450000000)
-        # LoRa Modulation Parameters (Spreading Factor, Bandwidth, Coding Rate)
-        # SF=12 (Maximum range), BW=125 kHz (as per config), CR=4/8
-        self.set_lora_modulation(12, 125, 6)
-        # Set output power to max allowed for 2.4 GHz (13 dBm)
-        self.set_output_power(13)
-        # Use an appropriate sync word (default LoRaWAN or custom for private networks)
-        self.set_sync_word(0xAB)  # Example sync word for 2.4 GHz LoRa
-        # Enable CRC for data integrity
-        self.enable_crc(False)
-        logger.info("2.4 GHz LoRa mode configured with 2450 MHz, 125 kHz BW, 13 dBm power.")
-        
-    def set_868mhz_mode(self):
-        """Configure settings for 868 MHz LoRa mode."""
-        logger.info("Configuring for 868 MHz LoRa mode.")
-        # Set frequency to 868 MHz (European ISM Band)
-        self.set_rf_frequency(868000000)
-        # LoRa Modulation Parameters (Spreading Factor, Bandwidth, Coding Rate)
-        # SF=12 (Maximum range), BW=125 kHz, CR=4/8 (for better reception)
-        self.set_lora_modulation(12, 125, 6)
-        # Set output power to max allowed for Sub-1 GHz (22 dBm)
-        self.set_output_power(22)
-        # Use the LoRaWAN public sync word (or a custom one for private networks)
-        self.set_sync_word(0xAB)  # Standard LoRaWAN sync word
-        # Enable CRC for data integrity
-        self.enable_crc(False)
-        logger.info("868 MHz LoRa mode configured with 125 kHz BW, 22 dBm power.")
-
-    def set_modulation(self, modulation_type):
-        """Change the modulation type."""
-        modulation_map = {
-            "FSK": 0x01,
-            "LoRa": 0x02,
-            "GFSK": 0x03
+        # Decode command status
+        command_status_map = {
+            0: "CMD_FAIL - Command could not be executed",
+            1: "CMD_PERR - Invalid opcode/arguments, possible DIO interrupt",
+            2: "CMD_OK - Command executed successfully",
+            3: "CMD_DAT - Command executed, data is being transmitted",
         }
-        if modulation_type not in modulation_map:
-            logger.error("Invalid modulation type: %s", modulation_type)
-            return
-        self.send_command(0x89, [modulation_map[modulation_type]])
-        logger.info("Modulation set to %s", modulation_type)
+        
+        command_status_str = command_status_map.get(command_status, "RFU - Reserved for future use")
+
+        # Decode interrupt status
+        interrupt_status_str = "No interrupt active" if interrupt_status == 0 else "At least one interrupt active"
+
+        # Logging debug details
+        logger.debug(f"Stat1 Raw Value: 0b{stat1:08b}.")
+        logger.debug(f"Extracted Command Status: {command_status} ({command_status_str}).")
+        logger.debug(f"Extracted Interrupt Status: {interrupt_status} ({interrupt_status_str}).")
+
+        # Log overall success or failure
+        if command_status in (2, 3):  # CMD_OK (2) or CMD_DAT (3)
+            logger.debug(f"Stat1: SUCCESS - {command_status_str}.")
+            return True
+        else:
+            logger.warning(f"Stat1: FAILURE - {command_status_str}.")
+            return False
+        
+    def _log_error_details(self, error_stat):
+        """
+        Log detailed information about the errors in the ErrorStat byte.
+
+        :param error_stat: The 16-bit error status byte.
+        """
+        error_messages = {
+            0: "LF_RC_CALIB_ERR: Calibration of low frequency RC was not done.",
+            1: "HF_RC_CALIB_ERR: Calibration of high frequency RC was not done.",
+            2: "ADC_CALIB_ERR: Calibration of ADC was not done.",
+            3: "PLL_CALIB_ERR: Calibration of maximum and minimum frequencies was not done.",
+            4: "IMG_CALIB_ERR: Calibration of the image rejection was not done.",
+            5: "HF_XOSC_START_ERR: High frequency XOSC did not start correctly.",
+            6: "LF_XOSC_START_ERR: Low frequency XOSC did not start correctly.",
+            7: "PLL_LOCK_ERR: The PLL did not lock.",
+            8: "RX_ADC_OFFSET_ERR: Calibration of ADC offset was not done.",
+        }
+        
+        logger.info("Error details:")
+        for bit, message in error_messages.items():
+            if error_stat & (1 << bit):
+                logger.info(f"  - {message}")
+
+    # --------------------------------------------------------------------------
+    # LoRa minimal setup (needed before TX, otherwise CMD_ERROR)
+    # --------------------------------------------------------------------------
+    def lora_setup_minimal(self):
+        # Put to Standby XOSC (stable clock) after TCXO
+        self.standby(STDBY_XOSC)
+        time.sleep_ms(5)
+
+        # Packet type = LoRa
+        self.send_command(LR1121_OP_SET_PACKET_TYPE, bytes([PACKET_TYPE_LORA]))
+
+        # Mod params (example: SF7, BW125, CR 4/5, LDRO=0)
+        # Bandwidth encoding depends on UM table; for many Semtech radios:
+        # 62.5=0x03, 125=0x04, 250=0x05, 500=0x06
+        sf = 7
+        bw = 0x03   # Narrowest bandwidth (62.5 kHz)
+        cr = 0x04   # Strongest error correction (4/8 coding rate)
+        ldro = 1
+        self.send_command(LR1121_OP_SET_MODULATION_PARAMS, bytes([sf, bw, cr, ldro]))
+
+        # Packet params:
+        # preamble_len (2B), header_type(0 explicit), payload_len(0 variable),
+        # crc_en(1), invert_iq(0)
+        preamble = 12
+        header_type = 0x00
+        payload_len = 0x00
+        crc_en = 0x01
+        invert_iq = 0x00
+        self.send_command(
+            LR1121_OP_SET_PACKET_PARAMS,
+            preamble.to_bytes(2, "big") + bytes([header_type, payload_len, crc_en, invert_iq])
+        )
+
+        # PA config (example: HP PA)
+        # pa_sel=1, reg_pa_supply=0 (VBAT), duty=7, hp_sel=7
+        self.send_command(LR1121_OP_SET_PA_CONFIG, bytes([1, 0, 7, 7]))
+
+        # TX params: power (dBm), ramp_time
+        # power 14 is safe start; tune later
+        self.send_command(LR1121_OP_SET_TX_PARAMS, bytes([14, 0]))
+
+        # Sync word (0x34 public, or your own)
+        self.send_command(LR1121_OP_SET_LORA_SYNC_WORD, bytes([0x34]))
+
+        # IRQ: enable only what we need on DIO9
+        self.clear_irq()
+        self.set_dio_irq_params(IRQ_TX_DONE | IRQ_TIMEOUT | IRQ_CMD_ERROR | IRQ_ERROR, 0)
+        self.clear_irq()
+
+    # --------------------------------------------------------------------------
+    # TX helpers
+    # --------------------------------------------------------------------------
+    def _write_buffer8(self, payload: bytes):
+        # WriteBuffer8: opcode + data bytes
+        self.send_command(LR1121_OP_WRITE_BUFFER8, payload)
+
+    def transmit_payload(self, payload: bytes, timeout_ms=15000) -> bool:
+        """
+        Real radio-level success:
+        - DIO9 IRQ wait
+        - confirm TX_DONE via GetStatus IRQ flags
+        """
+        self._dio9_clear_trigger()
+        self.clear_irq()
+
+        # 1) load payload
+        self._write_buffer8(payload)
+
+        # 2) start TX, timeout parameter is 24-bit
+        # 0x000000 = no radio timeout (host controls timeout)
+        self.send_command(LR1121_OP_SET_TX, b"\x00\x00\x00")
+
+        # 3) wait for DIO9 edge (or host timeout)
+        t0 = time.ticks_ms()
+        while not self.dio9_triggered:
+            if time.ticks_diff(time.ticks_ms(), t0) > timeout_ms:
+                print("⏱ Timeout waiting for DIO9.")
+                break
+            time.sleep_ms(10)
+
+        self._dio9_clear_trigger()
+
+        # 4) read IRQ flags (source of truth)
+        _, _, irq = self.get_status()
+
+        # 5) clear IRQ after read
+        if irq & IRQ_TX_DONE:
+            print(f"✅ TX_DONE. IRQ={irq:08b}.")
+            return True
+
+        if irq & IRQ_CMD_ERROR:
+            print(f"❌ CMD_ERROR. IRQ=0x{irq:08X}")
+            return False
+
+        if irq & IRQ_TIMEOUT:
+            print(f"❌ TIMEOUT. IRQ=0x{irq:08X}")
+            return False
+
+        if irq & IRQ_ERROR:
+            print(f"❌ ERROR. IRQ=0x{irq:08X}")
+            return False
+
+        print(f"❌ TX failed/unknown. IRQ=0x{irq:08X}")
+        return False
+
+    def transmit_json(self, obj, timeout_ms=15000, chunk_size=200) -> bool:
+        """
+        Sends JSON over LoRa as UTF-8 bytes.
+        If JSON is larger than chunk_size, splits into multiple packets with a small header.
+
+        Header format (very simple):
+        b'J' + total_chunks(1B) + chunk_index(1B) + payload_bytes
+        """
+        raw = ujson.dumps(obj).encode("utf-8")
+
+        if len(raw) <= chunk_size:
+            print("SEND JSON (single chunk)")
+            ok = self.transmit_payload(raw, timeout_ms=timeout_ms)
+            if ok:
+                print("✅ JSON TX success (1/1)")
+            else:
+                print("❌ JSON TX failed (1/1)")
+            return ok
+
+        # chunked
+        chunks = []
+        i = 0
+        while i < len(raw):
+            chunks.append(raw[i:i + chunk_size])
+            i += chunk_size
+
+        total = len(chunks)
+        for idx, part in enumerate(chunks, start=1):
+            # header: 'J' + total + idx
+            frame = b"J" + bytes([total & 0xFF, idx & 0xFF]) + part
+            print(f"SEND JSON chunk {idx}/{total} ({len(frame)} bytes)")
+            ok = self.transmit_payload(frame, timeout_ms=timeout_ms)
+            if ok:
+                print(f"✅ JSON TX success on chunk {idx}/{total}")
+            else:
+                print(f"❌ JSON TX failed on chunk {idx}/{total}")
+                return False
+
+        print("✅ JSON transmit finished successfully.")
+        return True
 
 
-# Example usage
-spi = machine.SPI(1, baudrate=5000000, polarity=0, phase=0)
-lr1121 = LR1121(spi, cs_pin=RADIO_CS_PIN, busy_pin=RADIO_BUSY_PIN, reset_pin=RADIO_RST_PIN, dio_pin=RADIO_DIO_PIN, led_pin=LED_PIN)
-
+# ==============================================================================
+# CLI Test
+# ==============================================================================
 if __name__ == "__main__":
-    lr1121.reset_device()
-    lr1121.set_2_4ghz_mode()
-    lr1121.set_modulation("LoRa")
-    while True:
-        lr1121.send_packet(b"Hello LoRa!")
-        received_data = lr1121.receive_packet(64)
-        logger.info("Received: %s", received_data)
-        time.sleep(10)
+    # Configure module logger
+    logging.basicConfig(level=logging.INFO)
+
+    # Pins
+    SCK_PIN  = 5
+    MISO_PIN = 3
+    MOSI_PIN = 6
+    NSS_PIN  = 7
+    BUSY_PIN = 34
+    RST_PIN  = 8
+    DIO9_PIN = 36
+
+    spi = SPI(
+        1,
+        baudrate=LR1121_SPI_BAUDRATE,
+        polarity=0,
+        phase=0,
+        sck=Pin(SCK_PIN),
+        mosi=Pin(MOSI_PIN),
+        miso=Pin(MISO_PIN),
+    )
+
+    radio = LR1121(
+        spi_bus=spi,
+        nss_pin=Pin(NSS_PIN),
+        busy_pin=Pin(BUSY_PIN),
+        rst_pin=Pin(RST_PIN),
+        dio9_pin=Pin(DIO9_PIN),
+    )
+
+    # 1) reset
+    radio.hardware_reset()
+
+    # 2) clear boot errors
+    radio.send_command(LR1121_OP_CLR_ERROR)
+
+    # 3) regulator
+    radio.set_regulator_ldo()
+
+    # 4) TCXO mode
+    radio.configure_tcxo(voltage=TCXO_VOLTAGE_1_8V, delay_ms=10)
+
+    # 5) set frequency (868 MHz)
+    radio.set_rf_frequency(868_000_000)
+
+    # 6) calibrate
+    err = radio.calibrate_system()
+
+    # 7) final status
+    err = radio.get_errors()
+    if err == 0:
+        print("System Ready. HF Clock is stable.")
+    else:
+        print("System Faulted.")
+        radio._log_error_details(err)
+
+    # 8) IMPORTANT: configure LoRa before TX (otherwise CMD_ERROR)
+    radio.lora_setup_minimal()
+
+    # 9) Send JSON
+    payload = {
+        "type": "ping",
+        "ts_ms": time.ticks_ms(),
+        "msg": "Hello from LR1121",
+    }
+
+    ok = radio.transmit_json(payload, timeout_ms=100, chunk_size=200)
+    if not ok:
+        print("❌ JSON transmit failed.")
+    else:
+        print("✅ JSON transmit OK.")
