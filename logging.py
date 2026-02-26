@@ -21,6 +21,17 @@ _level_dict = {
     NOTSET: "NOTSET",
 }
 
+# ANSI цвета для консоли
+_color_dict = {
+    CRITICAL: "\033[1;31m", # Жирный красный
+    ERROR: "\033[31m",      # Красный
+    WARNING: "\033[33m",    # Желтый
+    INFO: "\033[32m",       # Зеленый
+    DEBUG: "\033[36m",      # Голубой
+    NOTSET: "\033[0m",      # Сброс
+}
+_RESET_COLOR = "\033[0m"
+
 _loggers = {}
 _stream = sys.stderr
 _default_fmt = "%(asctime)s %(name)s [%(levelname)s] - %(message)s"
@@ -56,10 +67,11 @@ class Handler:
 
 
 class StreamHandler(Handler):
-    def __init__(self, stream=None):
+    def __init__(self, stream=None, use_color=True):
         super().__init__()
         self.stream = _stream if stream is None else stream
         self.terminator = "\n"
+        self.use_color = use_color
 
     def close(self):
         if hasattr(self.stream, "flush"):
@@ -67,12 +79,19 @@ class StreamHandler(Handler):
 
     def emit(self, record):
         if record.levelno >= self.level:
-            self.stream.write(self.format(record) + self.terminator)
+            msg = self.format(record)
+            # Добавляем цвет, если вывод идет в консоль
+            if self.use_color and hasattr(self.stream, "write"):
+                color = _color_dict.get(record.levelno, _RESET_COLOR)
+                msg = f"{color}{msg}{_RESET_COLOR}"
+            
+            self.stream.write(msg + self.terminator)
 
 
 class FileHandler(StreamHandler):
     def __init__(self, filename, mode="a", encoding="UTF-8"):
-        super().__init__(stream=open(filename, mode=mode, encoding=encoding))
+        # При записи в файл цвета отключаем (иначе будут кракозябры)
+        super().__init__(stream=open(filename, mode=mode, encoding=encoding), use_color=False)
 
     def close(self):
         super().close()
@@ -84,15 +103,19 @@ class Formatter:
         self.fmt = _default_fmt if fmt is None else fmt
 
     def usesTime(self):
-        return "asctime" in self.fmt
+        return "%(asctime)s" in self.fmt
 
     def formatTime(self, record):
         t = time.localtime(record.ct)
+        # MicroPython возвращает кортеж из 8 элементов
         return f"{t[0]:04}-{t[1]:02}-{t[2]:02} {t[3]:02}:{t[4]:02}:{t[5]:02}"
 
     def format(self, record):
         if self.usesTime():
             record.asctime = self.formatTime(record)
+            
+        # Формируем словарь только с нужными параметрами, чтобы избежать ошибок форматирования
+        # Выглядит чуть сложнее, но зато %()s работает железобетонно
         return self.fmt % {
             "name": record.name,
             "message": record.message,
@@ -175,44 +198,23 @@ def getLogger(name=None):
     return _loggers[name]
 
 
-def log(level, msg, *args):
-    getLogger().log(level, msg, *args)
-
-
-def debug(msg, *args):
-    getLogger().debug(msg, *args)
-
-
-def info(msg, *args):
-    getLogger().info(msg, *args)
-
-
-def warning(msg, *args):
-    getLogger().warning(msg, *args)
-
-
-def error(msg, *args):
-    getLogger().error(msg, *args)
-
-
-def critical(msg, *args):
-    getLogger().critical(msg, *args)
-
-
-def exception(msg, *args):
-    getLogger().exception(msg, *args)
-
+def log(level, msg, *args): getLogger().log(level, msg, *args)
+def debug(msg, *args): getLogger().debug(msg, *args)
+def info(msg, *args): getLogger().info(msg, *args)
+def warning(msg, *args): getLogger().warning(msg, *args)
+def error(msg, *args): getLogger().error(msg, *args)
+def critical(msg, *args): getLogger().critical(msg, *args)
+def exception(msg, *args): getLogger().exception(msg, *args)
 
 def shutdown():
-    for k, logger in _loggers.items():
+    """Исправленный shutdown: безопасно закрывает файлы и очищает словарь"""
+    for logger in _loggers.values():
         for h in logger.handlers:
             h.close()
-        _loggers.pop(logger, None)
-
+    _loggers.clear()
 
 def addLevelName(level, name):
     _level_dict[level] = name
-
 
 def basicConfig(
     filename=None,
@@ -249,9 +251,12 @@ if hasattr(sys, "atexit"):
     sys.atexit(shutdown)
     
 if __name__ == "__main__":
-    # Configure logging
+    # Тестируем новую красоту
     basicConfig(level=DEBUG)
-    logger = getLogger("logger")
+    logger = getLogger("MAIN")
 
-    # Initialize I2C bus
-    logger.info("Test log item.")
+    logger.debug("This is a debug message - Usually grey/blue")
+    logger.info("Everything is OK - Usually green")
+    logger.warning("Low memory warning - Usually yellow")
+    logger.error("Failed to transmit data! - Red")
+    logger.critical("SYSTEM HALTED - Bold Red")
