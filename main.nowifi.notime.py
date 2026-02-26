@@ -2,10 +2,10 @@
 import time
 import os
 import ujson
-import network
-import ntptime
 from machine import Pin, SPI, I2C
 import micropython
+
+# Импортируем твою собственную библиотеку logging.py
 import logging
 
 import ucryptolib 
@@ -20,19 +20,12 @@ from lr1121 import (
 micropython.alloc_emergency_exception_buf(256)
 
 # ==============================================================================
-# Инициализация логгеров
+# Инициализация логгеров (Используется твой custom logging)
 # ==============================================================================
-logging.basicConfig(level=logging.DEBUG) 
+logging.basicConfig(level=logging.DEBUG) # Установи INFO, чтобы скрыть DEBUG логи
 log_main = logging.getLogger("MAIN")
 log_oled = logging.getLogger("OLED")
 log_crypto = logging.getLogger("AES")
-
-# ==============================================================================
-# Настройки Wi-Fi и Времени
-# ==============================================================================
-WIFI_SSID = "Fold5"
-WIFI_PASS = "159632478"
-TIMEZONE_OFFSET = 2  # Смещение часового пояса (в часах), например +2 для Киева/Кишинева
 
 # ==============================================================================
 # Пины и настройки дисплея
@@ -58,19 +51,6 @@ TRIGGER_PIN = 0
 LED_PIN     = 37
 
 # ==============================================================================
-# Форматирование времени
-# ==============================================================================
-def format_time(timestamp=None):
-    """Форматирует Unix timestamp в 'ДД.ММ ЧЧ:ММ:СС'"""
-    if timestamp is None:
-        timestamp = time.time()
-    
-    # Добавляем смещение часового пояса (в секундах)
-    local_time = time.localtime(timestamp + (TIMEZONE_OFFSET * 3600))
-    # local_time = (year, month, mday, hour, minute, second, weekday, yearday)
-    return f"{local_time[2]:02d}.{local_time[1]:02d} {local_time[3]:02d}:{local_time[4]:02d}:{local_time[5]:02d}"
-
-# ==============================================================================
 # Продвинутый класс для OLED экрана
 # ==============================================================================
 class OLEDDisplay:
@@ -89,21 +69,11 @@ class OLEDDisplay:
             self.display.fill(0)
             self.display.show()
 
-    def draw_header(self, title, sub_title="", show_antenna=False):
+    def draw_header(self, title, show_antenna=False):
         if not self.display: return
+        self.display.fill_rect(0, 0, OLED_WIDTH, 14, 1)
+        self.display.text(title, 2, 3, 0)
         
-        # Если есть подзаголовок (качество сигнала), делаем хэдер шире
-        h_height = 20 if sub_title else 13
-        self.display.fill_rect(0, 0, OLED_WIDTH, h_height, 1)
-        
-        # Основной заголовок (черный на белом)
-        self.display.text(title, 2, 2, 0)
-        
-        # Подзаголовок (черный на белом)
-        if sub_title:
-            self.display.text(sub_title, 2, 11, 0)
-        
-        # Антенна
         if show_antenna:
             ax, ay = 110, 2
             self.display.pixel(ax+4, ay, 0)
@@ -134,28 +104,24 @@ class OLEDDisplay:
             self.draw_progress_bar(54, progress)
         self.display.show()
 
-    def show_message_box(self, title, message, signal_str="", time_str=""):
+    def show_message_box(self, title, message, sub_msg=""):
         if not self.display: return
         self.display.fill(0)
+        self.draw_header(title)
+        self.display.rect(0, 16, OLED_WIDTH, 48, 1)
         
-        # Рисуем хэдер (с сигналом, если он передан)
-        self.draw_header(title, sub_title=signal_str)
-        
-        # Рамка для сообщения начинается под хэдером
-        box_y = 22 if signal_str else 15
-        box_h = OLED_HEIGHT - box_y
-        self.display.rect(0, box_y, OLED_WIDTH, box_h, 1)
-        
-        # Разбиваем сообщение и выводим
+        # Разбиваем сообщение на куски по 15 символов
         chars_per_line = 15
         msg_lines = [message[i:i+chars_per_line] for i in range(0, len(message), chars_per_line)]
         
+        # Печатаем до 2 строк самого сообщения
+        y_offset = 20
         for i, line in enumerate(msg_lines[:2]): 
-            self.display.text(line, 4, box_y + 4 + (i * 12), 1)
+            self.display.text(line, 4, y_offset + (i * 12), 1)
             
-        # Выводим аккуратную дату в самом низу экрана
-        if time_str:
-            self.display.text(time_str[:15], 4, OLED_HEIGHT - 10, 1)
+        # Выводим качество сигнала (или таймстамп) в самом низу
+        if sub_msg:
+            self.display.text(sub_msg[:16], 4, 44, 1)
             
         self.display.show()
 
@@ -173,6 +139,7 @@ class AESCryptoManager:
             with open(key_path, 'rb') as f:
                 self.key = f.read(16)
             log_crypto.info("✅ Key loaded from %s", key_path)
+            log_crypto.debug("Key preview: %s...", self.key[:4].hex())
         except OSError:
             log_crypto.warning("No key found. Generating new 16-byte key...")
             self.key = os.urandom(16)
@@ -188,85 +155,41 @@ class AESCryptoManager:
         return data[:-data[-1]]
 
     def encrypt_json(self, data_dict) -> bytes:
-        if not self.key: return None
+        if not self.key: 
+            log_crypto.error("Cannot encrypt: missing AES key.")
+            return None
+            
+        log_crypto.debug("Encrypting payload dict: %s", data_dict)
         raw_bytes = ujson.dumps(data_dict).encode("utf-8")
+        log_crypto.debug("Plaintext JSON size: %d bytes", len(raw_bytes))
+        
         iv = os.urandom(self.block_size)
         cipher = ucryptolib.aes(self.key, 2, iv)
-        return iv + cipher.encrypt(self._pad(raw_bytes))
+        padded_data = self._pad(raw_bytes)
+        encrypted_data = iv + cipher.encrypt(padded_data)
+        
+        log_crypto.debug("Ciphertext generated. Total size: %d bytes (16B IV + %dB Data)", len(encrypted_data), len(encrypted_data) - 16)
+        return encrypted_data
 
     def decrypt_json(self, payload: bytes):
-        if not self.key or len(payload) <= self.block_size: return None
+        if not self.key or len(payload) <= self.block_size: 
+            log_crypto.error("Cannot decrypt: Payload too short (%d bytes) or key missing.", len(payload) if payload else 0)
+            return None
+            
+        log_crypto.debug("Attempting to decrypt %d bytes of ciphertext.", len(payload))
         iv, enc = payload[:self.block_size], payload[self.block_size:]
+        
         try:
             cipher = ucryptolib.aes(self.key, 2, iv)
             decrypted_raw = self._unpad(cipher.decrypt(enc))
-            return ujson.loads(decrypted_raw.decode("utf-8"))
+            parsed_json = ujson.loads(decrypted_raw.decode("utf-8"))
+            log_crypto.debug("✅ Decryption successful. Result: %s", parsed_json)
+            return parsed_json
         except Exception as e:
-            log_crypto.error("❌ Decryption failed: %s", str(e))
+            log_crypto.error("❌ Decryption/Parsing failed: %s", str(e))
+            log_crypto.debug("Raw payload hex dump: %s", payload.hex())
             return None
 
-# ==============================================================================
-# Подключение к Wi-Fi и синхронизация времени
-# ==============================================================================
-# ==============================================================================
-# Подключение к Wi-Fi и синхронизация времени
-# ==============================================================================
-def connect_wifi_and_sync(oled):
-    # Проверка на то, что данные Wi-Fi были изменены
-    if WIFI_SSID == "YOUR_WIFI_NAME":
-        log_main.warning("❌ Default Wi-Fi credentials detected. Skipping Wi-Fi.")
-        oled.show_status("WIFI SKIPPED", "Default config", progress=100)
-        time.sleep(1.5)
-        return
-
-    wlan = network.WLAN(network.STA_IF)
-    wlan.active(True)
-    
-    # Небольшая пауза для инициализации радиомодуля Wi-Fi
-    time.sleep_ms(200)
-    
-    # Сброс старых подключений (помогает от зависаний)
-    if wlan.isconnected():
-        wlan.disconnect()
-        time.sleep_ms(200)
-    
-    if not wlan.isconnected():
-        for attempt in range(1, 4):
-            log_main.info("Wi-Fi attempt %d/3...", attempt)
-            oled.show_status("WIFI INIT", f"Attempt {attempt}/3", WIFI_SSID[:15], progress=attempt*33)
-            
-            try:
-                wlan.connect(WIFI_SSID, WIFI_PASS)
-            except OSError as e:
-                # Перехват "Wifi Internal Error", чтобы скрипт не крашился
-                log_main.error("Wi-Fi internal error on attempt %d: %s", attempt, str(e))
-            
-            # Ждем до 5 секунд
-            for _ in range(50):
-                if wlan.isconnected():
-                    break
-                time.sleep_ms(100)
-                
-            if wlan.isconnected():
-                break
-
-    if wlan.isconnected():
-        ip = wlan.ifconfig()[0]
-        log_main.info("✅ Wi-Fi connected! IP: %s", ip)
-        oled.show_status("WIFI OK", "IP Address:", ip, progress=90)
-        time.sleep(1)
-        
-        try:
-            log_main.info("Syncing time via NTP...")
-            oled.show_status("NTP SYNC", "Fetching time...", progress=95)
-            ntptime.settime()
-            log_main.info("✅ Time synchronized: %s", format_time())
-        except Exception as e:
-            log_main.warning("❌ NTP Sync failed: %s", e)
-    else:
-        log_main.warning("❌ Wi-Fi connection failed. Using un-synced RTC.")
-        oled.show_status("WIFI FAILED", "Working offline", progress=100)
-        time.sleep(1.5)
 # ==============================================================================
 # LED & Trigger helpers
 # ==============================================================================
@@ -296,15 +219,15 @@ def main():
     trigger = Pin(TRIGGER_PIN, Pin.IN, Pin.PULL_DOWN)
     trigger.irq(flag.isr, trigger=Pin.IRQ_RISING)
 
-    # 1. Запуск экрана
+    # Запуск экрана
     i2c = I2C(0, scl=Pin(I2C_SCL), sda=Pin(I2C_SDA), freq=400000)
     oled = OLEDDisplay(i2c)
-    oled.show_status("BOOTING", "System Start...", progress=10)
     
-    # 2. Подключение к сети и синхронизация времени
-    connect_wifi_and_sync(oled)
+    for i in range(0, 101, 25):
+        oled.show_status("BOOTING", "Init LR1121...", "Loading AES...", progress=i)
+        time.sleep_ms(150)
 
-    # 3. Инициализация Радио
+    # Инициализация Радио
     log_main.debug("Configuring SPI for LR1121...")
     spi = SPI(1, baudrate=LR1121_SPI_BAUDRATE, polarity=0, phase=0, sck=Pin(SCK_PIN), mosi=Pin(MOSI_PIN), miso=Pin(MISO_PIN))
     radio = LR1121(spi_bus=spi, nss_pin=Pin(NSS_PIN), busy_pin=Pin(BUSY_PIN), rst_pin=Pin(RST_PIN), dio9_pin=Pin(DIO9_PIN))
@@ -312,7 +235,7 @@ def main():
     log_main.info("Initializing LR1121 Radio...")
     radio.init_radio()
     
-    # 4. Инициализация Крипто
+    # Инициализация Крипто
     crypto = AESCryptoManager(key_path="secret.key")
     
     mode_tx = True
@@ -336,17 +259,18 @@ def main():
             time.sleep_ms(500)
 
         if mode_tx:
-            # Отправляем актуальный timestamp вместо ticks_ms()
-            payload = {"msg": "Alarm!", "t": time.time()}
-            log_main.info("Initiating Transmission. Time: %s", format_time(payload["t"]))
+            payload = {"msg": "Alarm!", "t": time.ticks_ms()}
+            log_main.info("Initiating Transmission Sequence.")
             
             oled.show_status("TRANSMITTER", "Encrypting...", f"Data: {payload['msg']}", progress=30)
             encrypted_data = crypto.encrypt_json(payload)
 
             if encrypted_data:
                 size = len(encrypted_data)
+                log_main.info("Sending %d bytes over LoRa interface...", size)
                 oled.show_status("TRANSMITTER", "Sending...", f"Size: {size}b AES", progress=70, antenna=True)
                 
+                # Замеряем время отправки
                 t_start = time.ticks_ms()
                 ok = radio.transmit_payload(encrypted_data, timeout_ms=3000)
                 t_end = time.ticks_ms()
@@ -356,13 +280,15 @@ def main():
                     oled.show_status("TX SUCCESS", f"Sent: {size} bytes", "Secure Channel", progress=100, antenna=True)
                     blink_ok(led)
                 else:
-                    log_main.error("❌ TX Failed. Radio timeout or error.")
+                    log_main.error("❌ TX Failed. Radio timeout or command error.")
                     oled.show_status("TX ERROR", "Radio timeout", "Check antenna!", progress=0)
                     blink_fail(led)
             else:
+                log_main.error("TX Aborted: Encryption failed.")
                 oled.show_status("TX ERROR", "Crypto failed!", progress=0)
                 blink_fail(led)
 
+            log_main.debug("Waiting 3 seconds before next cycle...")
             time.sleep_ms(3000)
 
         else:
@@ -377,7 +303,8 @@ def main():
             if raw_data is not None:
                 display_idle = False
                 rx_size = len(raw_data)
-                log_main.info("📡 RX Event: Captured %d bytes.", rx_size)
+                log_main.info("📡 RX Event: Captured %d bytes from air.", rx_size)
+                log_main.debug("Raw RX Hex: %s", raw_data.hex())
                 
                 oled.show_status("RX DATA!", f"Size: {rx_size} bytes", "Decrypting...", progress=50, antenna=True)
                 
@@ -385,23 +312,25 @@ def main():
                 
                 if decrypted_obj is not None:
                     msg = decrypted_obj.get("msg", "Unknown")
-                    t_val = decrypted_obj.get("t", 0)
+                    t_val = decrypted_obj.get("t", "N/A")
                     
                     # Читаем уровень сигнала из драйвера
                     rssi = getattr(radio, 'last_rssi', 0)
                     snr = getattr(radio, 'last_snr', 0)
                     
-                    time_str = format_time(t_val)
+                    # Логируем
+                    log_main.info("✅ Data authenticated: '%s' (TS: %s)", msg, t_val)
+                    log_main.info("📶 Quality: RSSI=%.1f dBm, SNR=%.2f dB", rssi, snr)
+                    
+                    # Формируем компактную строку для экрана (макс 16 символов)
+                    # Выглядеть будет так: "R:-112.5 S:-5.2"
                     sig_str = f"R:{rssi} S:{snr}"
                     
-                    log_main.info("✅ Decoded: '%s' | Sent at: %s", msg, time_str)
-                    log_main.info("📶 Signal: %s dBm, SNR: %s dB", rssi, snr)
-                    
-                    # Выводим на экран: Заголовок, Сообщение (по центру), Сигнал (в хэдере), Время (внизу окна)
-                    oled.show_message_box("SECURE RX OK", msg, signal_str=sig_str, time_str=time_str)
+                    # Выводим на экран
+                    oled.show_message_box("SECURE RX OK", msg, sig_str)
                     
                     blink_ok(led)
-                    time.sleep(4) # Даем время прочитать сообщение на экране
+                    time.sleep(3)
                 else:
                     log_main.warning("❌ RX Payload rejected (Decryption failed).")
                     oled.show_status("RX ERROR", "Decryption fail", "Wrong secret key", progress=0)
@@ -412,7 +341,8 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        log_main.exception("🔥 FATAL ERROR: %s", str(e), exc_info=True)
+        log_main.critical("🔥 FATAL ERROR: %s", str(e), exc_info=True)
+        # Если есть экран, пробуем вывести ошибку на него
         try:
             i2c = I2C(0, scl=Pin(I2C_SCL), sda=Pin(I2C_SDA), freq=400000)
             oled = OLEDDisplay(i2c)
