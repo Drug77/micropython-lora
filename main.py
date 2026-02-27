@@ -32,43 +32,39 @@ log_crypto = logging.getLogger("AES")
 # ==============================================================================
 WIFI_SSID = "Fold5"
 WIFI_PASS = "159632478"
-TIMEZONE_OFFSET = 2  # Смещение часового пояса (в часах), например +2 для Киева/Кишинева
+TIMEZONE_OFFSET = 2  
 
-# ==============================================================================
-# Пины и настройки дисплея
-# ==============================================================================
-I2C_SDA = 18
-I2C_SCL = 17
+I2C_SDA, I2C_SCL = 18, 17
 DISPLAY_ADDR = 0x3C
-OLED_WIDTH = 128
-OLED_HEIGHT = 64
+OLED_WIDTH, OLED_HEIGHT = 128, 64
+
+SCK_PIN, MISO_PIN, MOSI_PIN, NSS_PIN = 5, 3, 6, 7
+BUSY_PIN, RST_PIN, DIO9_PIN = 34, 8, 36
+TRIGGER_PIN, LED_PIN = 0, 37
 
 # ==============================================================================
-# Пины радио LR1121 и периферии
+# Глобальные переменные для статистики сети
 # ==============================================================================
-SCK_PIN  = 5
-MISO_PIN = 3
-MOSI_PIN = 6
-NSS_PIN  = 7
-BUSY_PIN = 34
-RST_PIN  = 8
-DIO9_PIN = 36
-
-TRIGGER_PIN = 0
-LED_PIN     = 37
+tx_counter = 0
+rx_counter = 0
+lost_counter = 0
+expected_c = None
 
 # ==============================================================================
 # Форматирование времени
 # ==============================================================================
-def format_time(timestamp=None):
-    """Форматирует Unix timestamp в 'ДД.ММ ЧЧ:ММ:СС'"""
+def format_date_time(timestamp=None):
+    """Возвращает кортеж: (Дата, Время). Пример: ('Fr 27.02.2026', '12:30:44')"""
     if timestamp is None:
         timestamp = time.time()
     
-    # Добавляем смещение часового пояса (в секундах)
     local_time = time.localtime(timestamp + (TIMEZONE_OFFSET * 3600))
-    # local_time = (year, month, mday, hour, minute, second, weekday, yearday)
-    return f"{local_time[2]:02d}.{local_time[1]:02d} {local_time[3]:02d}:{local_time[4]:02d}:{local_time[5]:02d}"
+    days = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
+    wd = days[local_time[6]]
+    
+    date_str = f"{wd} {local_time[2]:02d}.{local_time[1]:02d}.{local_time[0]}"
+    time_str = f"{local_time[3]:02d}:{local_time[4]:02d}:{local_time[5]:02d}"
+    return date_str, time_str
 
 # ==============================================================================
 # Продвинутый класс для OLED экрана
@@ -91,19 +87,13 @@ class OLEDDisplay:
 
     def draw_header(self, title, sub_title="", show_antenna=False):
         if not self.display: return
-        
-        # Если есть подзаголовок (качество сигнала), делаем хэдер шире
         h_height = 20 if sub_title else 13
         self.display.fill_rect(0, 0, OLED_WIDTH, h_height, 1)
-        
-        # Основной заголовок (черный на белом)
         self.display.text(title, 2, 2, 0)
         
-        # Подзаголовок (черный на белом)
         if sub_title:
             self.display.text(sub_title, 2, 11, 0)
-        
-        # Антенна
+            
         if show_antenna:
             ax, ay = 110, 2
             self.display.pixel(ax+4, ay, 0)
@@ -123,6 +113,19 @@ class OLEDDisplay:
         if fill_width > 0:
             self.display.fill_rect(x + 2, y + 2, fill_width, height - 4, 1)
 
+    def update_progress_only(self, y, percent):
+        """Перерисовывает только шкалу прогресса без моргания экрана"""
+        if not self.display: return
+        width = OLED_WIDTH - 4
+        height = 8
+        x = 2
+        self.display.fill_rect(x, y, width, height, 0) # Очистка старой полосы
+        self.display.rect(x, y, width, height, 1)      # Рамка
+        fill_width = int((width - 4) * (percent / 100.0))
+        if fill_width > 0:
+            self.display.fill_rect(x + 2, y + 2, fill_width, height - 4, 1)
+        self.display.show()
+
     def show_status(self, title, line1="", line2="", line3="", progress=None, antenna=False):
         if not self.display: return
         self.display.fill(0)
@@ -134,28 +137,22 @@ class OLEDDisplay:
             self.draw_progress_bar(54, progress)
         self.display.show()
 
-    def show_message_box(self, title, message, signal_str="", time_str=""):
+    def show_rx_box(self, title, message, signal_str, date_str, stats_str):
+        """Специальное компактное окно для отображения пакета со статистикой"""
         if not self.display: return
         self.display.fill(0)
         
-        # Рисуем хэдер (с сигналом, если он передан)
         self.draw_header(title, sub_title=signal_str)
-        
-        # Рамка для сообщения начинается под хэдером
-        box_y = 22 if signal_str else 15
+        box_y = 22
         box_h = OLED_HEIGHT - box_y
         self.display.rect(0, box_y, OLED_WIDTH, box_h, 1)
         
-        # Разбиваем сообщение и выводим
-        chars_per_line = 15
-        msg_lines = [message[i:i+chars_per_line] for i in range(0, len(message), chars_per_line)]
+        # Вывод самого сообщения
+        self.display.text(message[:15], 4, box_y + 4, 1)
         
-        for i, line in enumerate(msg_lines[:2]): 
-            self.display.text(line, 4, box_y + 4 + (i * 12), 1)
-            
-        # Выводим аккуратную дату в самом низу экрана
-        if time_str:
-            self.display.text(time_str[:15], 4, OLED_HEIGHT - 10, 1)
+        # Вывод даты и статистики (ровно по 16 символов макс)
+        self.display.text(date_str, 4, box_y + 16, 1)
+        self.display.text(stats_str, 4, box_y + 26, 1)
             
         self.display.show()
 
@@ -208,9 +205,6 @@ class AESCryptoManager:
 # ==============================================================================
 # Подключение к Wi-Fi и синхронизация времени
 # ==============================================================================
-# ==============================================================================
-# Подключение к Wi-Fi и синхронизация времени
-# ==============================================================================
 def connect_wifi_and_sync(oled):
     # Проверка на то, что данные Wi-Fi были изменены
     if WIFI_SSID == "YOUR_WIFI_NAME":
@@ -225,10 +219,7 @@ def connect_wifi_and_sync(oled):
     # Небольшая пауза для инициализации радиомодуля Wi-Fi
     time.sleep_ms(200)
     
-    # Сброс старых подключений (помогает от зависаний)
-    if wlan.isconnected():
-        wlan.disconnect()
-        time.sleep_ms(200)
+    if wlan.isconnected(): wlan.disconnect(); time.sleep_ms(200)
     
     if not wlan.isconnected():
         for attempt in range(1, 4):
@@ -260,13 +251,16 @@ def connect_wifi_and_sync(oled):
             log_main.info("Syncing time via NTP...")
             oled.show_status("NTP SYNC", "Fetching time...", progress=95)
             ntptime.settime()
-            log_main.info("✅ Time synchronized: %s", format_time())
+            # Распаковываем кортеж из двух значений: дата и время
+            d_str, t_str = format_date_time()
+            log_main.info("✅ Time synchronized: %s %s", d_str, t_str)
         except Exception as e:
             log_main.warning("❌ NTP Sync failed: %s", e)
     else:
         log_main.warning("❌ Wi-Fi connection failed. Using un-synced RTC.")
         oled.show_status("WIFI FAILED", "Working offline", progress=100)
         time.sleep(1.5)
+
 # ==============================================================================
 # LED & Trigger helpers
 # ==============================================================================
@@ -289,6 +283,8 @@ class TriggerFlag:
 # Main
 # ==============================================================================
 def main():
+    global tx_counter, rx_counter, lost_counter, expected_c
+
     log_main.info("=== SYSTEM BOOTING ===")
     led = Pin(LED_PIN, Pin.OUT, value=0)
 
@@ -336,28 +332,44 @@ def main():
             time.sleep_ms(500)
 
         if mode_tx:
-            # Отправляем актуальный timestamp вместо ticks_ms()
-            payload = {"msg": "Alarm!", "t": time.time()}
-            log_main.info("Initiating Transmission. Time: %s", format_time(payload["t"]))
+            tx_counter += 1
+            payload = {"msg": "Alarm!", "t": time.time(), "c": tx_counter}
             
-            oled.show_status("TRANSMITTER", "Encrypting...", f"Data: {payload['msg']}", progress=30)
+            oled.show_status("TRANSMITTER", "Encrypting...", f"Pkt: #{tx_counter}", progress=0)
             encrypted_data = crypto.encrypt_json(payload)
 
             if encrypted_data:
                 size = len(encrypted_data)
-                oled.show_status("TRANSMITTER", "Sending...", f"Size: {size}b AES", progress=70, antenna=True)
                 
+                # Запрашиваем у драйвера расчетное время в эфире
+                expected_toa = radio.get_time_on_air_ms(size)
+                log_main.info("Initiating TX (Packet #%d). Expected ToA: %d ms", tx_counter, expected_toa)
+                
+                oled.show_status("TRANSMITTER", f"Sending #{tx_counter}", f"ToA: {expected_toa/1000:.1f}s", progress=0, antenna=True)
+                
+                # Функция обратного вызова для плавного заполнения бара
+                last_pct = 0
+                def tx_progress(elapsed_ms):
+                    nonlocal last_pct
+                    pct = int((elapsed_ms / expected_toa) * 100)
+                    if pct > 100: pct = 100
+                    # Обновляем экран только если процент изменился (экономия ресурсов)
+                    if pct - last_pct >= 2:
+                        oled.update_progress_only(54, pct)
+                        last_pct = pct
+
                 t_start = time.ticks_ms()
-                ok = radio.transmit_payload(encrypted_data, timeout_ms=10000)
+                # Передаем наш callback в драйвер!
+                ok = radio.transmit_payload(encrypted_data, timeout_ms=10000, progress_cb=tx_progress)
                 t_end = time.ticks_ms()
                 
                 if ok:
-                    log_main.info("✅ TX Success (Airtime: %d ms)", time.ticks_diff(t_end, t_start))
-                    oled.show_status("TX SUCCESS", f"Sent: {size} bytes", "Secure Channel", progress=100, antenna=True)
+                    actual_toa = time.ticks_diff(t_end, t_start)
+                    log_main.info("✅ TX Success (Airtime: %d ms)", actual_toa)
+                    oled.show_status("TX SUCCESS", f"Sent: {size} bytes", f"Time: {actual_toa/1000:.1f}s", progress=100, antenna=True)
                     blink_ok(led)
                 else:
-                    log_main.error("❌ TX Failed. Radio timeout or error.")
-                    oled.show_status("TX ERROR", "Radio timeout", "Check antenna!", progress=0)
+                    oled.show_status("TX ERROR", "Radio timeout", progress=0)
                     blink_fail(led)
             else:
                 oled.show_status("TX ERROR", "Crypto failed!", progress=0)
@@ -368,8 +380,7 @@ def main():
         else:
             # РЕЖИМ ПРИЕМА (RX)
             if not display_idle:
-                log_main.info("🎧 Listening for incoming packets...")
-                oled.show_status("RECEIVER", "Listening...", "Awaiting data", progress=0, antenna=True)
+                oled.show_status("RECEIVER", "Listening...", f"RX:{rx_counter} L:{lost_counter}", progress=0, antenna=True)
                 display_idle = True
             
             raw_data = radio.receive_payload(timeout_ms=30000, max_len=255)
@@ -386,25 +397,39 @@ def main():
                 if decrypted_obj is not None:
                     msg = decrypted_obj.get("msg", "Unknown")
                     t_val = decrypted_obj.get("t", 0)
+                    c_val = decrypted_obj.get("c", 0) # Читаем номер пакета
                     
-                    # Читаем уровень сигнала из драйвера
+                    # Логика подсчета потерь пакетов
+                    rx_counter += 1
+                    if expected_c is not None:
+                        if c_val > expected_c:
+                            lost_counter += (c_val - expected_c)
+                        elif c_val < expected_c:
+                            # Отправитель был перезагружен (счетчик сбросился)
+                            lost_counter = 0 
+                            rx_counter = 1
+                    expected_c = c_val + 1
+                    
                     rssi = getattr(radio, 'last_rssi', 0)
                     snr = getattr(radio, 'last_snr', 0)
                     
-                    time_str = format_time(t_val)
+                    date_str, time_str = format_date_time(t_val)
+                    
+                    # Формируем компактные строки (до 16 символов)
                     sig_str = f"R:{rssi} S:{snr}"
+                    # Пример: "12:30 RX:5 L:0"
+                    stats_str = f"{time_str[:5]} RX:{rx_counter} L:{lost_counter}" 
                     
-                    log_main.info("✅ Decoded: '%s' | Sent at: %s", msg, time_str)
-                    log_main.info("📶 Signal: %s dBm, SNR: %s dB", rssi, snr)
+                    log_main.info("✅ Decoded: '%s' | Packet: #%d", msg, c_val)
+                    log_main.info("📶 Signal: %s dBm, SNR: %s dB | Lost Total: %d", rssi, snr, lost_counter)
                     
-                    # Выводим на экран: Заголовок, Сообщение (по центру), Сигнал (в хэдере), Время (внизу окна)
-                    oled.show_message_box("SECURE RX OK", msg, signal_str=sig_str, time_str=time_str)
+                    # Выводим супер-информативное окно
+                    oled.show_rx_box("SECURE RX OK", msg, sig_str, date_str, stats_str)
                     
                     blink_ok(led)
-                    time.sleep(4) # Даем время прочитать сообщение на экране
+                    time.sleep(4)
                 else:
-                    log_main.warning("❌ RX Payload rejected (Decryption failed).")
-                    oled.show_status("RX ERROR", "Decryption fail", "Wrong secret key", progress=0)
+                    oled.show_status("RX ERROR", "Decryption fail", progress=0)
                     blink_fail(led)
                     time.sleep(2)
 
@@ -412,9 +437,9 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        log_main.exception("🔥 FATAL ERROR: %s", str(e), exc_info=True)
+        log_main.exception("🔥 FATAL ERROR: %s", str(e))
         try:
             i2c = I2C(0, scl=Pin(I2C_SCL), sda=Pin(I2C_SDA), freq=400000)
             oled = OLEDDisplay(i2c)
-            oled.show_message_box("CRASHED", str(e)[:30])
+            oled.show_status("CRASHED", "See Console", str(e)[:15])
         except: pass

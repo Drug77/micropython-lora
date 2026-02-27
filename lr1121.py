@@ -269,14 +269,13 @@ class LR1121:
         t_payload = (8 + val * 8) * t_sym
         return int(t_preamble + t_payload)
 
-    def transmit_payload(self, payload: bytes, timeout_ms=15000) -> bool:
+    def transmit_payload(self, payload: bytes, timeout_ms=15000, progress_cb=None) -> bool:
         self._dio9_clear_trigger()
         self.clear_irq()
 
         payload_len = len(payload)
-        logger.debug("Preparing to transmit %d bytes. Hex: %s", payload_len, payload.hex())
+        logger.debug("Preparing TX %d bytes...", payload_len)
 
-        # Update packet parameters for current payload length
         preamble, header_type, crc_en, invert_iq = 12, 0x00, 0x01, 0x00
         self.send_command(
             LR1121_OP_SET_PACKET_PARAMS,
@@ -289,16 +288,20 @@ class LR1121:
 
         t0 = time.ticks_ms()
         while not self.dio9_triggered:
-            if time.ticks_diff(time.ticks_ms(), t0) > timeout_ms:
-                logger.error("⏱ Timeout waiting for DIO9 (TX DONE).")
+            elapsed = time.ticks_diff(time.ticks_ms(), t0)
+            if elapsed > timeout_ms:
+                logger.error("⏱ Timeout waiting for TX_DONE.")
                 break
-            time.sleep_ms(10)
+            # Вызываем callback для прогресс-бара
+            if progress_cb:
+                progress_cb(elapsed)
+            time.sleep_ms(20) # Пауза 20мс, чтобы не спамить экран
 
         self._dio9_clear_trigger()
         _, _, irq = self.get_status()
 
         if irq & IRQ_TX_DONE:
-            logger.info("✅ Radio TX_DONE. IRQ=0x%08X", irq)
+            logger.info("✅ Radio TX_DONE.")
             return True
         if irq & IRQ_CMD_ERROR:
             logger.error("❌ Radio CMD_ERROR. IRQ=0x%08X", irq)
