@@ -77,6 +77,10 @@ class LR1121:
         self.rst = rst_pin
         self.dio9 = dio9_pin
         self.dio9_triggered = False
+        
+        # Переменные для хранения качества последнего сигнала
+        self.last_rssi = 0.0
+        self.last_snr = 0.0
 
         self.nss.init(Pin.OUT, value=1)
         self.rst.init(Pin.OUT, value=1)
@@ -84,9 +88,6 @@ class LR1121:
 
         self.dio9.init(Pin.IN, Pin.PULL_DOWN)
         self.dio9.irq(self._dio9_irq, trigger=Pin.IRQ_RISING)
-
-        self.last_rssi = 0
-        self.last_snr = 0
 
         logger.info("LR1121 Driver Initialized.")
 
@@ -194,22 +195,16 @@ class LR1121:
 
     def _log_error_details(self, error_stat):
         error_messages = {
-            0: "LF_RC_CALIB_ERR: Low frequency RC calib fail",
-            1: "HF_RC_CALIB_ERR: High frequency RC calib fail",
-            2: "ADC_CALIB_ERR: ADC calib fail",
-            3: "PLL_CALIB_ERR: PLL calib fail",
-            4: "IMG_CALIB_ERR: Image rejection calib fail",
-            5: "HF_XOSC_START_ERR: HF XOSC start fail",
-            6: "LF_XOSC_START_ERR: LF XOSC start fail",
-            7: "PLL_LOCK_ERR: PLL failed to lock",
-            8: "RX_ADC_OFFSET_ERR: RX ADC offset calib fail",
+            0: "LF_RC_CALIB_ERR", 1: "HF_RC_CALIB_ERR", 2: "ADC_CALIB_ERR",
+            3: "PLL_CALIB_ERR", 4: "IMG_CALIB_ERR", 5: "HF_XOSC_START_ERR",
+            6: "LF_XOSC_START_ERR", 7: "PLL_LOCK_ERR", 8: "RX_ADC_OFFSET_ERR",
         }
         for bit, message in error_messages.items():
             if error_stat & (1 << bit):
                 logger.error("  - %s", message)
 
     # --------------------------------------------------------------------------
-    # Init Radio
+    # Init Radio (ДАЛЬНОБОЙНЫЕ НАСТРОЙКИ)
     # --------------------------------------------------------------------------
     def init_radio(self):
         self.hardware_reset()
@@ -232,31 +227,47 @@ class LR1121:
         logger.debug("Applying LoRa Modulation parameters...")
         self.send_command(LR1121_OP_SET_PACKET_TYPE, bytes([PACKET_TYPE_LORA]))
 
-        # SF7, BW125, CR 4/5, LDRO=0
-        sf, bw, cr, ldro = 7, 0x03, 0x04, 1
+        # === МАКСИМАЛЬНАЯ ДАЛЬНОСТЬ (SF12, BW125) ===
+        sf = 12       # Spreading Factor 12 (Самый медленный, самый пробивной)
+        bw = 0x04     # Bandwidth 125 kHz
+        cr = 0x04     # Coding Rate 4/8 (максимальная защита от ошибок)
+        ldro = 1      # Low Data Rate Optimization (Обязательно для SF12)
         self.send_command(LR1121_OP_SET_MODULATION_PARAMS, bytes([sf, bw, cr, ldro]))
 
-        # Dummy packet params (updated dynamically in transmit_payload)
+        # Dummy packet params
         preamble, header_type, payload_len, crc_en, invert_iq = 12, 0x00, 255, 0x01, 0x00
         self.send_command(
             LR1121_OP_SET_PACKET_PARAMS,
             preamble.to_bytes(2, "big") + bytes([header_type, payload_len, crc_en, invert_iq]),
         )
 
-        self.send_command(LR1121_OP_SET_PA_CONFIG, bytes([1, 0, 7, 7]))
-        self.send_command(LR1121_OP_SET_TX_PARAMS, bytes([14, 0]))
+        # === МАКСИМАЛЬНАЯ МОЩНОСТЬ (+22 дБм) ===
+        # pa_sel=1 (HP PA), reg_pa_supply=1 (VBAT), duty_cycle=4, hp_max=7
+        self.send_command(LR1121_OP_SET_PA_CONFIG, bytes([1, 1, 4, 7]))
+        # power=22 dBm, ramp_time=0
+        self.send_command(LR1121_OP_SET_TX_PARAMS, bytes([22, 0]))
+        
         self.send_command(LR1121_OP_SET_LORA_SYNC_WORD, bytes([0x12]))
 
         self.clear_irq()
-        self.set_dio_irq_params(IRQ_TX_DONE | IRQ_TIMEOUT | IRQ_CMD_ERROR | IRQ_ERROR, 0)
+        self.set_dio_irq_params(IRQ_TX_DONE | IRQ_TIMEOUT | IRQ_CMD_ERROR | IRQ_ERROR | IRQ_RX_DONE, 0)
         self.clear_irq()
-        logger.info("LoRa Configuration applied successfully.")
+        logger.info("✅ Long-Range Config applied (+22dBm, SF12).")
 
     # --------------------------------------------------------------------------
     # TX Helpers
     # --------------------------------------------------------------------------
     def _write_buffer8(self, payload: bytes):
         self.send_command(LR1121_OP_WRITE_BUFFER8, payload)
+
+    def get_time_on_air_ms(self, payload_len: int) -> int:
+        """Вычисляет примерное время в эфире (ToA) для SF12, BW125, CR4/8"""
+        t_sym = 32.768 # Длительность одного символа в мс
+        t_preamble = 16.25 * t_sym
+        num = 8 * payload_len - 4
+        val = (num + 39) // 40 if num > 0 else 0
+        t_payload = (8 + val * 8) * t_sym
+        return int(t_preamble + t_payload)
 
     def transmit_payload(self, payload: bytes, timeout_ms=15000) -> bool:
         self._dio9_clear_trigger()
@@ -327,7 +338,6 @@ class LR1121:
     # --------------------------------------------------------------------------
     def _read_buffer8(self, length: int, offset: int = 0) -> bytes:
         if length <= 0: return b""
-
         self._wait_busy()
         self.nss.value(0)
         self.spi.write(struct.pack(">H", LR1121_OP_READ_BUFFER8))
@@ -367,7 +377,6 @@ class LR1121:
         if irq & IRQ_RX_DONE:
             payload_len, start = self.get_rx_buffer_status()
 
-            # 👇 --- НОВЫЙ КОД --- 👇
             rssi, snr, sig_rssi = self.get_packet_status()
             
             if payload_len <= 0:

@@ -348,7 +348,7 @@ def main():
                 oled.show_status("TRANSMITTER", "Sending...", f"Size: {size}b AES", progress=70, antenna=True)
                 
                 t_start = time.ticks_ms()
-                ok = radio.transmit_payload(encrypted_data, timeout_ms=3000)
+                ok = radio.transmit_payload(encrypted_data, timeout_ms=10000)
                 t_end = time.ticks_ms()
                 
                 if ok:
@@ -372,7 +372,7 @@ def main():
                 oled.show_status("RECEIVER", "Listening...", "Awaiting data", progress=0, antenna=True)
                 display_idle = True
             
-            raw_data = radio.receive_payload(timeout_ms=5000, max_len=255)
+            raw_data = radio.receive_payload(timeout_ms=30000, max_len=255)
 
             if raw_data is not None:
                 display_idle = False
