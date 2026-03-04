@@ -1,105 +1,98 @@
 import logging
-import time
-from machine import Pin, I2C
 from ssd1306 import SSD1306_I2C
-from config import OLED_WIDTH, OLED_HEIGHT, DISPLAY_ADDR, I2C_SDA, I2C_SCL
 
-logger = logging.getLogger("OLED")
 
+OLED_WIDTH, OLED_HEIGHT = 128, 64
+DISPLAY_ADDR = 0x3C
+
+logger = logging.getLogger(__name__)
+
+# ==============================================================================
+# Продвинутый класс для OLED экрана
+# ==============================================================================
 class OLEDDisplay:
-    def __init__(self, i2c):
-        """Initialize the OLED display"""
-        self.display = SSD1306_I2C(OLED_WIDTH, OLED_HEIGHT, i2c, addr=DISPLAY_ADDR)
-        self.clear()
-        self.font_size = 1  # Default font size
-        logger.info("OLED display initialized.")
-    
-    def clear(self):
-        """Clear the OLED display"""
-        self.display.fill(0)
-        self.display.show()
-        logger.debug("OLED display cleared.")
-    
-    def set_font_size(self, size):
-        """Set the font size (only supports basic scaling)"""
-        if size not in [1, 2, 3]:
-            raise ValueError("Font size must be 1, 2, or 3")
-        self.font_size = size
-        logger.info(f"Font size set to {size}")
-    
-    def wrap_text(self, text):
-        """Wrap text to fit within OLED width"""
-        max_chars_per_line = OLED_WIDTH // (8 * self.font_size)  # Approximate char limit per line
-        wrapped_lines = []
-        words = text.split()
-        current_line = ""
-
-        for word in words:
-            if len(current_line) + len(word) <= max_chars_per_line:
-                current_line += word + " "
-            else:
-                wrapped_lines.append(current_line.strip())
-                current_line = word + " "
-        
-        if current_line:
-            wrapped_lines.append(current_line.strip())
-
-        max_lines = OLED_HEIGHT // (8 * self.font_size)  # Max lines based on font size
-        if len(wrapped_lines) > max_lines:
-            raise ValueError("Text is too long to fit on the display!")
-
-        return wrapped_lines
-    
-    def update_display(self, message, center=False):
-        """Update the OLED display with a message, with optional centering"""
-        self.clear()
+    def __init__(self, i2c_bus):
+        logger.debug("Initializing OLED on I2C (addr: 0x%02X)", DISPLAY_ADDR)
         try:
-            lines = self.wrap_text(message)
-        except ValueError as e:
-            logger.error(str(e))
-            raise
+            self.display = SSD1306_I2C(OLED_WIDTH, OLED_HEIGHT, i2c_bus, addr=DISPLAY_ADDR)
+            self.clear()
+            logger.info("✅ Display initialized.")
+        except Exception as e:
+            logger.error("❌ Display Init failed: %s", str(e))
+            self.display = None
 
-        y = 0
-        for line in lines:
-            x = 0
-            if center:
-                text_width = len(line) * 8 * self.font_size
-                x = (OLED_WIDTH - text_width) // 2  # Center horizontally
-            
-            # Render text multiple times for larger font effect
-            for i in range(self.font_size):
-                for j in range(self.font_size):
-                    self.display.text(line, x + i, y + j)
+    def clear(self):
+        if self.display:
+            self.display.fill(0)
+            self.display.show()
 
-            y += 8 * self.font_size  # Move to next row based on font size
+    def draw_header(self, title, sub_title="", show_antenna=False):
+        if not self.display: return
+        h_height = 20 if sub_title else 13
+        self.display.fill_rect(0, 0, OLED_WIDTH, h_height, 1)
+        self.display.text(title, 2, 2, 0)
         
+        if sub_title:
+            self.display.text(sub_title, 2, 11, 0)
+            
+        if show_antenna:
+            ax, ay = 110, 2
+            self.display.pixel(ax+4, ay, 0)
+            self.display.hline(ax+3, ay+1, 3, 0)
+            self.display.hline(ax+2, ay+2, 5, 0)
+            self.display.hline(ax+1, ay+3, 7, 0)
+            self.display.vline(ax+4, ay+4, 6, 0)
+            self.display.pixel(ax+4, ay+10, 0)
+
+    def draw_progress_bar(self, y, percent):
+        if not self.display: return
+        width = OLED_WIDTH - 4
+        height = 8
+        x = 2
+        self.display.rect(x, y, width, height, 1)
+        fill_width = int((width - 4) * (percent / 100.0))
+        if fill_width > 0:
+            self.display.fill_rect(x + 2, y + 2, fill_width, height - 4, 1)
+
+    def update_progress_only(self, y, percent):
+        """Перерисовывает только шкалу прогресса без моргания экрана"""
+        if not self.display: return
+        width = OLED_WIDTH - 4
+        height = 8
+        x = 2
+        self.display.fill_rect(x, y, width, height, 0) # Очистка старой полосы
+        self.display.rect(x, y, width, height, 1)      # Рамка
+        fill_width = int((width - 4) * (percent / 100.0))
+        if fill_width > 0:
+            self.display.fill_rect(x + 2, y + 2, fill_width, height - 4, 1)
         self.display.show()
-        logger.info(f"OLED display updated: '{message}'.")
 
-if __name__ == "__main__":
-    i2c = I2C(0, scl=Pin(I2C_SCL), sda=Pin(I2C_SDA))
-    oled = OLEDDisplay(i2c)
-    
-    # Test default text
-    oled.update_display("Default Text")
-    time.sleep(2)
-    
-    # Test wrapping
-    oled.update_display("This is a longer message that should wrap correctly.", center=False)
-    time.sleep(2)
+    def show_status(self, title, line1="", line2="", line3="", progress=None, antenna=False):
+        if not self.display: return
+        self.display.fill(0)
+        self.draw_header(title, show_antenna=antenna)
+        self.display.text(line1, 2, 18, 1)
+        self.display.text(line2, 2, 30, 1)
+        self.display.text(line3, 2, 42, 1)
+        if progress is not None:
+            self.draw_progress_bar(54, progress)
+        self.display.show()
 
-    # Test centering
-    oled.update_display("Centered!", center=True)
-    time.sleep(2)
-
-    # Test font sizes
-    for size in [1, 2, 3]:
-        oled.set_font_size(size)
-        oled.update_display(f"Size {size}", center=True)
-        time.sleep(2)
-
-    # Test error case (text too long)
-    try:
-        oled.update_display("This message is way too long to fit on the screen, it should raise an error.", center=False)
-    except ValueError as e:
-        print("Error caught:", str(e))
+    def show_rx_box(self, title, message, signal_str, date_str, stats_str):
+        """Специальное компактное окно для отображения пакета со статистикой"""
+        if not self.display: return
+        self.display.fill(0)
+        
+        self.draw_header(title, sub_title=signal_str)
+        box_y = 22
+        box_h = OLED_HEIGHT - box_y
+        self.display.rect(0, box_y, OLED_WIDTH, box_h, 1)
+        
+        # Вывод самого сообщения
+        self.display.text(message[:15], 4, box_y + 4, 1)
+        
+        # Вывод даты и статистики (ровно по 16 символов макс)
+        self.display.text(date_str, 4, box_y + 16, 1)
+        self.display.text(stats_str, 4, box_y + 26, 1)
+            
+        self.display.show()

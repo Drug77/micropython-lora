@@ -1,5 +1,6 @@
 import time
 import struct
+import machine
 from machine import Pin, SPI
 import ujson
 import micropython
@@ -454,6 +455,22 @@ class LR1121:
         self.last_snr = snr_pkt
         
         return rssi_pkt, snr_pkt, signal_rssi_pkt
+    
+    def prepare_for_deepsleep(self):
+        logger.info("💤 Preparing for Deep Sleep...")
+
+        # 1. Отключаем экран (обязательно, иначе он будет светиться и жрать батарею)
+        # oled.poweroff() # Нужно добавить метод в класс OLEDDisplay: self.display.poweroff()
+        
+        # 2. Переводим радио в режим ожидания пакета
+        # Очищаем флаги прерываний
+        self.clear_irq()
+        # Указываем радиомодулю дернуть DIO9 при получении пакета
+        self.set_dio_irq_params(IRQ_RX_DONE, 0)
+        # Включаем бесконечный прием (Continuous RX)
+        self.send_command(LR1121_OP_SET_RX, b"\xff\xff\xff")
+        
+        # ВАЖНО: Мы не вызываем radio.standby()! Радио остается работать.
 
 
 # ==============================================================================
