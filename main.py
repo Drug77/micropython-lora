@@ -1,4 +1,5 @@
 # main.py
+from battery import BatteryMonitor
 from crypto import AESCryptoManager
 import esp32
 from machine import Pin, SPI, I2C
@@ -8,6 +9,8 @@ import micropython
 import network
 import ntptime
 import time
+import urequests
+import ujson
 
 from lr1121 import LR1121, LR1121_SPI_BAUDRATE
 from oled import OLEDDisplay
@@ -28,7 +31,9 @@ log_crypto = logging.getLogger("AES")
 # ==============================================================================
 WIFI_SSID = "Fold5"
 WIFI_PASS = "159632478"
-TIMEZONE_OFFSET = 2  
+TIMEZONE_OFFSET = 2
+# Сюда вставь свой токен из кабинета LoRa Cloud
+LORA_CLOUD_TOKEN = "СЮДА_ВСТАВИТЬ_ТОКЕН"
 
 I2C_SDA, I2C_SCL = 18, 17
 DISPLAY_ADDR = 0x3C
@@ -38,6 +43,7 @@ SCK_PIN, MISO_PIN, MOSI_PIN, NSS_PIN = 5, 3, 6, 7
 BUSY_PIN, RST_PIN, DIO9_PIN = 34, 8, 36
 TRIGGER_PIN, LED_PIN = 0, 37
 SHOCK_PIN_NUM = 11   # Пин вибродатчика (пример)
+BATTERY_ADC = 1
 
 # ==============================================================================
 # Глобальные переменные для статистики сети
@@ -47,9 +53,74 @@ rx_counter = 0
 lost_counter = 0
 expected_c = None
 
+def resolve_gnss_cloud(nav_hex):
+    """
+    Отправляет HEX-строку NAV-сообщения от LR1121 в Semtech LoRa Cloud.
+    Возвращает кортеж (Широта, Долгота, Точность) или None, если не вышло.
+    """
+    if not nav_hex:
+        return None
+
+    # Endpoint для вычисления автономного (single-frame) скана LR1110/LR1121
+    url = "https://gls.loracloud.com/api/v3/solve/gnss_lr1110_singleframe"
+    
+    headers = {
+        "Authorization": LORA_CLOUD_TOKEN,
+        "Content-Type": "application/json"
+    }
+    
+    data = {
+        "payload": nav_hex
+    }
+
+    try:
+        logger.info("☁️ Sending GNSS NAV data to LoRa Cloud for analysis...")
+        # Делаем POST-запрос
+        response = urequests.post(url, headers=headers, data=ujson.dumps(data))
+        
+        # Читаем статус и текст
+        status = response.status_code
+        text_response = response.text
+        response.close() # Обязательно закрываем сокет, чтобы не текла память
+
+        if status == 200:
+            result = ujson.loads(text_response)
+            
+            # Проверяем, нет ли ошибок обработки в самом ответе
+            if "errors" in result and result["errors"]:
+                logger.error("❌ Cloud Error: %s", result["errors"])
+                return None
+
+            # Достаем заветные координаты (llh = Latitude, Longitude, Height)
+            if "result" in result and "llh" in result["result"]:
+                lat, lon, alt = result["result"]["llh"]
+                accuracy = result["result"].get("accuracy", 0)
+                
+                logger.info("📍 SUCCESS! Coordinates resolved:")
+                logger.info("   Lat: %.6f, Lon: %.6f", lat, lon)
+                logger.info("   Accuracy: ±%d meters", accuracy)
+                
+                return lat, lon, accuracy
+            else:
+                logger.warning("☁️ Cloud processed it, but couldn't resolve location (not enough satellites).")
+                return None
+        else:
+            logger.error("❌ HTTP Error %d: %s", status, text_response)
+            return None
+
+    except Exception as e:
+        logger.error("❌ API Request failed (No internet?): %s", e)
+        return None
+
 def go_to_deepsleep():
-    # Указываем, что ESP32 должна проснуться, если на ЛЮБОМ из этих пинов появится "1" (WAKEUP_ANY_HIGH)
-    esp32.wake_on_ext1(pins=(DIO9_PIN), level=esp32.WAKEUP_ANY_HIGH)
+    # 1. Создаем физический объект пина, который будет "дежурить" во сне
+    # Обязательно делаем подтяжку к земле (PULL_DOWN), чтобы избежать ложных пробуждений
+    # Pin 0 to 21 only
+    dio9_wake_pin = Pin(21, Pin.IN, Pin.PULL_DOWN)
+    
+    # 2. Передаем этот объект в кортеже (обрати внимание на запятую после dio9_wake_pin!)
+    esp32.wake_on_ext1(pins=(dio9_wake_pin,), level=esp32.WAKEUP_ANY_HIGH)
+    
     time.sleep_ms(100) # Даем логгеру время вывести текст в консоль
     machine.deepsleep()
 
@@ -128,6 +199,13 @@ def connect_wifi_and_sync(oled):
         oled.show_status("WIFI FAILED", "Working offline", progress=100)
         time.sleep(1.5)
 
+    # В конце функции connect_wifi_and_sync добавь это:
+    if wlan.isconnected():
+        wlan.disconnect()
+    wlan.active(False) # <--- ПОЛНОСТЬЮ ОБЕСТОЧИТЬ WI-FI
+    logger.info("🔌 Wi-Fi disabled to prevent sleep crashes.")
+    time.sleep(1.5)
+
 # ==============================================================================
 # LED & Trigger helpers
 # ==============================================================================
@@ -182,6 +260,9 @@ def main():
         # Обычное включение, инициализируем Wi-Fi и т.д.
 
     logger.info("=== SYSTEM BOOTING ===")
+    # Инициализация Монитора Батареи
+    bat_monitor = BatteryMonitor(adc_pin=BATTERY_ADC)
+
     led = Pin(LED_PIN, Pin.OUT, value=0)
 
     flag = TriggerFlag()
@@ -231,8 +312,19 @@ def main():
             time.sleep_ms(500)
 
         if mode_tx:
-            tx_counter += 1
-            payload = {"msg": "Alarm!", "t": time.time(), "c": tx_counter}
+            # Читаем батарею!
+            v, pct, is_chrg = bat_monitor.get_status()
+            ch_icon = "⚡" if is_chrg else "🔋"
+            logger.info(f"Battery parameters: {v} volts ({pct}%) {ch_icon}.")
+            
+            payload = {
+                "msg": "Alarm!", 
+                "t": time.time(), 
+                "c": tx_counter,
+                "v": v,
+                "b": pct,       # Добавили процент батареи
+                "ch": is_chrg  # Флаг: 1 - заряжается, 0 - от батареи,
+            }
             
             oled.show_status("TRANSMITTER", "Encrypting...", f"Pkt: #{tx_counter}", progress=0)
             encrypted_data = crypto.encrypt_json(payload)
@@ -297,6 +389,13 @@ def main():
                     msg = decrypted_obj.get("msg", "Unknown")
                     t_val = decrypted_obj.get("t", 0)
                     c_val = decrypted_obj.get("c", 0) # Читаем номер пакета
+                    v = decrypted_obj.get("v", 0)
+                    pct = decrypted_obj.get("b", 0)
+                    is_chrg = decrypted_obj.get("ch", False)
+
+                    logger.info("✅ Alarm Received: '%s'", msg)
+                    ch_icon = "⚡" if is_chrg else "🔋"
+                    logger.info(f"Recived Battery parameters: {v} volts ({pct}%) {ch_icon}.")
                     
                     # Логика подсчета потерь пакетов
                     rx_counter += 1
@@ -314,6 +413,7 @@ def main():
                     
                     date_str, time_str = format_date_time(t_val)
                     
+                    msg_str = f"{msg} B:{pct}%"
                     # Формируем компактные строки (до 16 символов)
                     sig_str = f"R:{rssi} S:{snr}"
                     # Пример: "12:30 RX:5 L:0"
@@ -323,18 +423,19 @@ def main():
                     logger.info("📶 Signal: %s dBm, SNR: %s dB | Lost Total: %d", rssi, snr, lost_counter)
                     
                     # Выводим супер-информативное окно
-                    oled.show_rx_box("SECURE RX OK", msg, sig_str, date_str, stats_str)
+                    oled.show_rx_box("SECURE RX OK", msg_str, sig_str, date_str, stats_str)
                     
                     blink_ok(led)
-                    
-                    logger.info("🛌 Good night!")
-                    oled.show_status("DEEP SLEEP", "Going to sleep!")
-                    go_to_deepsleep()
+                    time.sleep(5)
 
                 else:
                     oled.show_status("RX ERROR", "Decryption fail", progress=0)
                     blink_fail(led)
                     time.sleep(2)
+
+            logger.info("🛌 Good night!")
+            oled.show_status("DEEP SLEEP", "Going to sleep!")
+            #go_to_deepsleep()
 
 if __name__ == "__main__":
     try:
@@ -346,3 +447,4 @@ if __name__ == "__main__":
             oled = OLEDDisplay(i2c)
             oled.show_status("CRASHED", "See Console", str(e)[:15])
         except: pass
+        
