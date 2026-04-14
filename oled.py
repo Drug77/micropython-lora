@@ -78,6 +78,70 @@ class OLEDDisplay:
             self.draw_progress_bar(54, progress)
         self.display.show()
 
+    def _draw_battery_icon(self, x, y, label, percent, is_charging):
+        """
+        Battery widget: label (3 chars) + icon + percentage.
+        Occupies ~55 px wide, 19 px tall.
+
+        Pixel layout (relative to x, y):
+          [x]         label text (24 px)
+          [x+26, y]   battery body rect  26×9 px
+          [x+52, y+3] nub (positive terminal) 3×3 px
+          [x+26, y+11] percentage text
+        """
+        if not self.display:
+            return
+        self.display.text(label[:3], x, y, 1)
+
+        bx, by, bw, bh = x + 26, y, 26, 9
+        self.display.rect(bx, by, bw, bh, 1)
+        self.display.fill_rect(bx + bw, by + 3, 3, 3, 1)   # nub
+
+        fill = max(0, int((bw - 4) * percent / 100))
+        if fill > 0:
+            self.display.fill_rect(bx + 2, by + 2, fill, bh - 4, 1)
+
+        pct_str = f"{percent}%" + ("+" if is_charging else "")
+        self.display.text(pct_str, bx, y + 11, 1)
+
+    def show_rx_alarm(self, signal_str, car_pct, car_charging,
+                      my_pct, my_charging, radar_str, stats_str):
+        """
+        Full alarm screen with dual battery indicators (128×64).
+
+        y= 0..12  inverted header "ALARM RX" + antenna icon
+        y=14..21  signal quality (R/SNR)
+        y=23..31  battery bodies side-by-side (separator at x=63)
+        y=34..41  battery percentage labels
+        y=42..49  radar detection string
+        y=51..59  stats (time, rx count, lost)
+        """
+        if not self.display:
+            return
+        self.display.fill(0)
+
+        self.draw_header("ALARM RX", show_antenna=True)
+
+        # Signal quality row
+        self.display.text(signal_str[:16], 0, 14, 1)
+
+        # Vertical separator between the two battery widgets
+        self.display.vline(63, 22, 20, 1)
+
+        # Left: CAR battery (TX unit, data from payload)
+        self._draw_battery_icon(0, 23, "CAR", car_pct, car_charging)
+
+        # Right: MY battery (this RX unit)
+        self._draw_battery_icon(65, 23, "YOU", my_pct, my_charging)
+
+        # Radar detection
+        self.display.text(radar_str[:16], 0, 42, 1)
+
+        # Stats line (time + rx/lost counters)
+        self.display.text(stats_str[:16], 0, 52, 1)
+
+        self.display.show()
+
     def show_rx_box(self, title, message, signal_str, date_str, stats_str):
         """Специальное компактное окно для отображения пакета со статистикой"""
         if not self.display: return
