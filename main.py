@@ -9,12 +9,15 @@ import micropython
 import network
 import ntptime
 import time
-import urequests
 import ujson
 
 from lr1121 import LR1121, LR1121_SPI_BAUDRATE
 from oled import OLEDDisplay
-from ld2410b import LD2410B
+
+try:
+    from ld2410b import LD2410B
+except ImportError:
+    LD2410B = None  # RX unit — no radar hardware
 
 
 micropython.alloc_emergency_exception_buf(256)
@@ -211,11 +214,12 @@ def main():
 
     # 1b. Инициализация радара (только для TX-блока в машине)
     radar = None
-    try:
-        radar = LD2410B(uart_id=RADAR_UART_ID, tx_pin=RADAR_TX_PIN, rx_pin=RADAR_RX_PIN)
-        logger.info("LD2410B radar initialized UART%d TX=%d RX=%d", RADAR_UART_ID, RADAR_TX_PIN, RADAR_RX_PIN)
-    except Exception as e:
-        logger.error("Radar init failed (no sensor?): %s", e)
+    if LD2410B is not None:
+        try:
+            radar = LD2410B(uart_id=RADAR_UART_ID, tx_pin=RADAR_TX_PIN, rx_pin=RADAR_RX_PIN)
+            logger.info("LD2410B radar initialized UART%d TX=%d RX=%d", RADAR_UART_ID, RADAR_TX_PIN, RADAR_RX_PIN)
+        except Exception as e:
+            logger.error("Radar init failed (no sensor?): %s", e)
 
     # Проверяем, почему мы включились
     wake_reason = machine.wake_reason()

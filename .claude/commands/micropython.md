@@ -14,6 +14,8 @@
 - `chip` → выполни **[Режим: chip]**
 - `version` → выполни **[Режим: version]**
 - `memory` → выполни **[Режим: memory]**
+- `deploy` → выполни **[Режим: deploy]**
+- Начинается с `logs` → выполни **[Режим: logs]** (передай остаток аргумента)
 
 Если аргумент не распознан — скажи пользователю:
 ```
@@ -22,6 +24,11 @@
   /micropython chip     — информация о чипе
   /micropython version  — версия MicroPython
   /micropython memory   — доступная RAM и диск
+  /micropython deploy   — залить последние изменения кода
+  /micropython logs     — захватить лог загрузки (20 сек)
+  /micropython logs 100 — первые 100 строк после сброса
+  /micropython logs last — весь лог загрузки (синоним logs)
+  /micropython logs stream — стримить serial в реальном времени
 ```
 
 ---
@@ -111,3 +118,135 @@
 4. Покажи результаты в удобочитаемом виде (переведи байты в KB/MB где уместно).
 
 Если устройство не отвечает — скажи пользователю нажать RESET для нормальной загрузки (не режим загрузчика).
+
+---
+
+## [Режим: deploy]
+
+Залить последние изменения кода на устройство (TX или RX блок).
+
+1. Выполни **[Общий шаг: поиск порта]**.
+
+2. Спроси через `AskUserQuestion`, какой блок подключён:
+   - **TX — машина** (есть радар LD2410B, отправляет тревогу)
+   - **RX — брелок** (принимает сигнал, без радара)
+
+3. В зависимости от выбора скопируй соответствующий набор файлов:
+
+   **TX (машина):**
+   ```
+   python -m mpremote connect <PORT> cp main.py lr1121.py crypto.py oled.py battery.py logging.py ssd1306.py ld2410b.py boot.py webrepl_cfg.py secret.key :
+   ```
+
+   **RX (брелок):**
+   ```
+   python -m mpremote connect <PORT> cp main.py lr1121.py crypto.py oled.py battery.py logging.py ssd1306.py boot.py webrepl_cfg.py secret.key :
+   ```
+
+4. Покажи пользователю, какие файлы обновились (строки без `Up to date:`), а какие уже были актуальны.
+
+5. Перезагрузи устройство:
+   ```
+   python -m mpremote connect <PORT> reset
+   ```
+
+6. Проверь, что устройство запустилось:
+   ```
+   python -m mpremote connect <PORT> exec "import sys; print('OK:', sys.version)"
+   ```
+   Покажи результат пользователю.
+
+Если устройство не отвечает после reset — скажи пользователю нажать RESET вручную.
+
+---
+
+## [Режим: logs]
+
+Читать логи с устройства через serial-порт.
+
+> Логи пишутся только в StreamHandler (serial). Файла на диске нет.
+> «last N строк» = «первые N строк после перезагрузки».
+
+### Разбор аргумента
+
+Возьми часть `$ARGUMENTS` после слова `logs` и обрежь пробелы:
+
+- Пусто, `all`, `last` → `mode=all`, `limit=None`
+- Число (например `100`) → `mode=all`, `limit=<N>`
+- `stream` или `-s` → `mode=stream`
+
+---
+
+### mode=all (захват с начала загрузки)
+
+1. Выполни **[Общий шаг: поиск порта]**.
+
+2. Захват + мягкий сброс одной командой. Подставь `<PORT>` и `<LIMIT>` (`None` если без ограничения).
+   Порт открывается ДО сброса, поэтому начало лога не теряется:
+   ```
+   python -c "
+   import serial, sys, time, io
+   sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+   port = '<PORT>'
+   limit = <LIMIT>
+   timeout_s = 25
+   s = serial.Serial(port, 115200, timeout=0.3)
+   s.write(b'\r\x03\x03')
+   time.sleep(0.2)
+   s.reset_input_buffer()
+   s.write(b'\x04')
+   count = 0
+   start = time.time()
+   while time.time() - start < timeout_s:
+       line = s.readline()
+       if line:
+           text = line.decode('utf-8', errors='replace').rstrip()
+           if text:
+               print(text)
+               sys.stdout.flush()
+               count += 1
+               if limit is not None and count >= limit:
+                   break
+   s.close()
+   print(f'--- {count} lines captured ---')
+   "
+   ```
+   Пояснение: `\x03\x03` = Ctrl+C дважды (прерывает main.py), `\x04` = Ctrl+D (soft reset MicroPython).
+
+3. Покажи вывод пользователю. ANSI escape-коды (цвета) присутствуют — это нормально.
+
+---
+
+### mode=stream (реальное время)
+
+1. Выполни **[Общий шаг: поиск порта]**.
+
+2. Скажи пользователю:
+   ```
+   Устройство НЕ перезагружается — подключаюсь к текущему выводу serial.
+   Запустите команду ниже в терминале, Ctrl+C для остановки:
+
+     python -c "
+   import serial, sys
+   s = serial.Serial('<PORT>', 115200, timeout=0.1)
+   print('=== Streaming (Ctrl+C to stop) ===')
+   try:
+       while True:
+           data = s.read(256)
+           if data:
+               sys.stdout.write(data.decode('utf-8', errors='replace'))
+               sys.stdout.flush()
+   except KeyboardInterrupt:
+       pass
+   finally:
+       s.close()
+       print()
+       print('=== Stream stopped ===')
+   "
+
+   Или введи в prompt: ! python -c "..."
+   ```
+
+3. Подставь реальный `<PORT>` в команду выше перед показом пользователю.
+
+   Не запускай эту команду через Bash-инструмент — она блокирующая.

@@ -54,6 +54,33 @@ VCC      →  3.3V
 
 ---
 
+## Работа с устройством через Claude Code
+
+Проект включает кастомный скилл `/micropython` для автоматизации всех операций с устройством.
+
+### Быстрый старт
+
+```
+/micropython              — прошить firmware (выбор .bin файла)
+/micropython chip         — информация о чипе и flash-памяти
+/micropython version      — версия MicroPython на устройстве
+/micropython memory       — свободная RAM и место на диске
+/micropython deploy       — залить код на TX или RX блок
+/micropython logs         — boot-лог (soft reset + захват 25 сек)
+/micropython logs 50      — первые 50 строк boot-лога
+/micropython logs stream  — стрим serial в реальном времени
+```
+
+Скилл автоматически определяет COM-порт устройства по VID `303A` (Espressif).
+
+### Логи
+
+`/micropython logs` делает soft reset через serial (`Ctrl+C` + `Ctrl+D`) и захватывает весь вывод с самой первой строки загрузки. Не использует `mpremote reset`, чтобы не терять начало лога.
+
+`/micropython logs stream` выдаёт готовую команду для запуска в терминале — стрим блокирующий, поэтому его нужно запускать напрямую (`! python -c "..."`), а останавливать `Ctrl+C`.
+
+---
+
 ## Установка прошивки (первый раз, через USB)
 
 ```bash
