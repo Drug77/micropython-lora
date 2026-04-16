@@ -21,20 +21,32 @@ _level_dict = {
     NOTSET: "NOTSET",
 }
 
-# ANSI цвета для консоли
+# ANSI цвета в стиле rich — bold/bg для высоких уровней, dim для DEBUG
 _color_dict = {
-    CRITICAL: "\033[1;31m", # Жирный красный
-    ERROR: "\033[31m",      # Красный
-    WARNING: "\033[33m",    # Желтый
-    INFO: "\033[32m",       # Зеленый
-    DEBUG: "\033[36m",      # Голубой
-    NOTSET: "\033[0m",      # Сброс
+    CRITICAL: "\033[1;97;41m",  # Bold white on red bg
+    ERROR:    "\033[1;31m",     # Bold red
+    WARNING:  "\033[1;33m",     # Bold yellow
+    INFO:     "\033[32m",       # Green
+    DEBUG:    "\033[2;37m",     # Dim gray
+    NOTSET:   "\033[0m",
 }
 _RESET_COLOR = "\033[0m"
 
+# Цвета для имени логгера и метки уровня (rich-стиль)
+_level_style = {
+    CRITICAL: "\033[1;97;41m",  # Bold white on red
+    ERROR:    "\033[1;31m",     # Bold red
+    WARNING:  "\033[33m",       # Yellow (не bold для метки)
+    INFO:     "\033[1;34m",     # Bold blue
+    DEBUG:    "\033[2;36m",     # Dim cyan
+}
+_NAME_COLOR = "\033[1;35m"      # Bold magenta для имени модуля
+_TIME_COLOR = "\033[2;37m"      # Dim gray для даты/времени
+_SEP_COLOR  = "\033[2;37m"      # Dim gray для разделителей
+
 _loggers = {}
 _stream = sys.stderr
-_default_fmt = "%(asctime)s %(name)s [%(levelname)s] - %(message)s"
+_default_fmt = "%(asctime)s %(name)s [%(levelname)s] %(message)s"
 
 
 class LogRecord:
@@ -79,13 +91,28 @@ class StreamHandler(Handler):
 
     def emit(self, record):
         if record.levelno >= self.level:
-            msg = self.format(record)
-            # Добавляем цвет, если вывод идет в консоль
+            # Вызываем format() чтобы заполнить asctime
+            self.format(record)
+
             if self.use_color and hasattr(self.stream, "write"):
-                color = _color_dict.get(record.levelno, _RESET_COLOR)
-                msg = f"{color}{msg}{_RESET_COLOR}"
-            
-            self.stream.write(msg + self.terminator)
+                # Rich-стиль: каждая часть строки окрашена отдельно
+                tc = _TIME_COLOR
+                nc = _NAME_COLOR
+                lc = _level_style.get(record.levelno, _RESET_COLOR)
+                mc = _color_dict.get(record.levelno, _RESET_COLOR)
+                sc = _SEP_COLOR
+                r = _RESET_COLOR
+
+                asc = record.asctime or ""
+                ln  = record.levelname
+                nm  = record.name
+                msg = record.message or ""
+
+                line = f"{tc}{asc}{r} {nc}{nm}{r} {sc}[{r}{lc}{ln}{r}{sc}]{r} {mc}{msg}{r}"
+                self.stream.write(line + self.terminator)
+            else:
+                msg = self.format(record)
+                self.stream.write(msg + self.terminator)
 
 
 class FileHandler(StreamHandler):

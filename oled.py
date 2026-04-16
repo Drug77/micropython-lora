@@ -142,6 +142,61 @@ class OLEDDisplay:
 
         self.display.show()
 
+    def show_tx_armed(self, radar_str, bat_pct, charging, idle_s, idle_max, pkt):
+        """TX armed status — компактный экран патрулирования.
+
+        ┌────────────────┐
+        │▌TX ARMED    📡 │  inverted header
+        │ Radar: Clear   │
+        │ 0cm  Bat:100%+ │
+        │ Pkt:42  ░░░░░░ │  idle progress
+        └────────────────┘
+        """
+        if not self.display: return
+        self.display.fill(0)
+        self.draw_header("TX ARMED", show_antenna=True)
+        self.display.text(radar_str[:16], 2, 16, 1)
+        bat_str = f"Bat:{bat_pct}%{'+'if charging else ''}"
+        self.display.text(bat_str, 2, 28, 1)
+        self.display.text(f"Pkt:{pkt}", 2, 40, 1)
+        # Idle progress bar (заполняется к sleep)
+        pct = min(int(idle_s / idle_max * 100), 100) if idle_max > 0 else 0
+        self.draw_progress_bar(54, pct)
+        # Подпись над progress bar
+        idle_lbl = f"{int(idle_s)}s/{idle_max}s"
+        self.display.text(idle_lbl, 70, 40, 1)
+        self.display.show()
+
+    def show_tx_disarmed(self, bat_pct, charging, pkt):
+        """TX disarmed — минимальный экран."""
+        if not self.display: return
+        self.display.fill(0)
+        self.draw_header("DISARMED")
+        self.display.text("Press BOOT", 20, 22, 1)
+        self.display.text("to arm", 36, 34, 1)
+        bat_str = f"Bat:{bat_pct}% Pkt:{pkt}"
+        self.display.text(bat_str, 2, 52, 1)
+        self.display.show()
+
+    def show_rx_idle(self, bat_pct, charging, rx_cnt, lost_cnt):
+        """RX idle — ожидание пакетов.
+
+        ┌────────────────┐
+        │▌RX LISTEN   📡 │
+        │                │
+        │  Listening...  │
+        │                │
+        │ Bat:95% RX:5 L:0│
+        └────────────────┘
+        """
+        if not self.display: return
+        self.display.fill(0)
+        self.draw_header("RX LISTEN", show_antenna=True)
+        self.display.text("Listening...", 20, 28, 1)
+        self.display.text(f"Bat:{bat_pct}%{'+'if charging else ''}", 2, 46, 1)
+        self.display.text(f"RX:{rx_cnt} L:{lost_cnt}", 2, 56, 1)
+        self.display.show()
+
     def show_rx_box(self, title, message, signal_str, date_str, stats_str):
         """Специальное компактное окно для отображения пакета со статистикой"""
         if not self.display: return

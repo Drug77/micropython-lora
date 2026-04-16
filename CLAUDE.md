@@ -68,7 +68,8 @@ Password is in `webrepl_cfg.py` (`PASS = "ota12345"`). Change before deploying.
 | I2C SDA / SCL (OLED) | 18 / 17 |
 | Trigger button / OTA gate | 0 |
 | LED | 37 |
-| Wake pin (ext1) | 8 |
+| Wake pin (ext1) / Radar OUT | 8 |
+| Vibration sensor (ext1) | 11 |
 | Battery ADC | 1 |
 | LD2410B radar TX / RX | 9 / 10 (UART1) |
 | ATGM336H GPS TX / RX (reserved) | 16 / 15 (UART2) |
@@ -96,10 +97,11 @@ Both TX and RX units must share the same `secret.key` (16-byte AES key). On firs
 
 ### Deep Sleep / Wakeup
 
-- Deep sleep is entered after an RX timeout in RX mode.
-- Car unit (TX + radar) does **not** deep sleep — radar must scan continuously.
-- `esp32.wake_on_ext1` on GPIO 8 wakes the CPU when the radio signals a packet.
-- On wakeup, `machine.wake_description()` identifies which pin fired; `need_radio_init` is set `False`.
+- **RX mode:** enters deep sleep after 30 s receive timeout. Wake on GPIO 8 (radio DIO9 packet). Before sleep: `radio.prepare_for_deepsleep()` sets continuous RX.
+- **TX mode without radar:** sends one "Radar Error" → deep sleep. Wake on GPIO 8 (radar OUT) + GPIO 11 (vibration).
+- **TX mode with radar:** enters deep sleep after `TX_IDLE_SLEEP_S` (60 s) of no detections. Wake on radar OUT (GPIO 8) + vibration (GPIO 11).
+- On wakeup: `machine.wake_description()` identifies which pin fired (guarded by `hasattr` — may not exist in all MicroPython versions). Wakeup source determines alarm type: `"Vibration!"` (ts=-2) or `"Alarm!"` (ts=radar data).
+- `mode_tx` is determined by `LD2410B is not None` (driver importable = TX unit), not by wakeup path.
 
 ### Archived / Variant Files
 

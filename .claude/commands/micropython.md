@@ -123,38 +123,43 @@
 
 ## [Режим: deploy]
 
-Залить последние изменения кода на устройство (TX или RX блок).
+Залить код на устройство. Одинаковый набор файлов для TX и RX.
+Режим определяется файлом `config.py` на устройстве (MODE = "TX" | "RX").
 
 1. Выполни **[Общий шаг: поиск порта]**.
 
 2. Спроси через `AskUserQuestion`, какой блок подключён:
-   - **TX — машина** (есть радар LD2410B, отправляет тревогу)
-   - **RX — брелок** (принимает сигнал, без радара)
+   - **TX — машина** (радар, датчик вибрации, отправка тревог)
+   - **RX — брелок** (приём тревог, пинг машины)
 
-3. В зависимости от выбора скопируй соответствующий набор файлов:
-
-   **TX (машина):**
+3. Скопируй **одинаковый** набор файлов (единая кодовая база):
    ```
    python -m mpremote connect <PORT> cp main.py lr1121.py crypto.py oled.py battery.py logging.py ssd1306.py ld2410b.py boot.py webrepl_cfg.py secret.key :
    ```
 
-   **RX (брелок):**
+4. Создай/обнови `config.py` на устройстве в зависимости от выбора:
+
+   **TX:**
    ```
-   python -m mpremote connect <PORT> cp main.py lr1121.py crypto.py oled.py battery.py logging.py ssd1306.py boot.py webrepl_cfg.py secret.key :
+   python -m mpremote connect <PORT> exec "f=open('config.py','w'); f.write('MODE = \"TX\"\n'); f.close(); print('config.py: TX')"
    ```
 
-4. Покажи пользователю, какие файлы обновились (строки без `Up to date:`), а какие уже были актуальны.
+   **RX:**
+   ```
+   python -m mpremote connect <PORT> exec "f=open('config.py','w'); f.write('MODE = \"RX\"\n'); f.close(); print('config.py: RX')"
+   ```
 
-5. Перезагрузи устройство:
+5. Покажи пользователю, какие файлы обновились (строки без `Up to date:`).
+
+6. Перезагрузи устройство:
    ```
    python -m mpremote connect <PORT> reset
    ```
 
-6. Проверь, что устройство запустилось:
+7. Проверь, что устройство запустилось:
    ```
    python -m mpremote connect <PORT> exec "import sys; print('OK:', sys.version)"
    ```
-   Покажи результат пользователю.
 
 Если устройство не отвечает после reset — скажи пользователю нажать RESET вручную.
 
