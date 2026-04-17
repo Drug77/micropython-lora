@@ -252,42 +252,42 @@ def blink_fail(led):
 
 
 class TriggerFlag:
-    """Кнопка с определением short/long press.
+    """Кнопка с определением short/long press через ISR + schedule.
 
-    ISR фиксирует нажатие. check(pin) блокирующе ждёт отпускания
-    или порога LONG_PRESS_MS, возвращает 'short', 'long' или None.
+    ISR захватывает pin.value() синхронно, schedule обрабатывает.
+    FALLING: записывает время. RISING: вычисляет длительность.
+    check() неблокирующий.
     """
     def __init__(self):
-        self._pressed = False
+        self._result = None
         self._press_time = 0
-        self._last_press = 0  # debounce
 
-    def _handle(self, _arg):
+    def _handle(self, val):
         now = time.ticks_ms()
-        if time.ticks_diff(now, self._last_press) < 300:
-            return  # debounce
-        self._pressed = True
-        self._press_time = now
-        self._last_press = now
+        if val == 0:
+            # Кнопка нажата
+            self._press_time = now
+        else:
+            # Кнопка отпущена
+            if self._press_time > 0:
+                duration = time.ticks_diff(now, self._press_time)
+                self._result = "long" if duration >= LONG_PRESS_MS else "short"
+                self._press_time = 0
 
-    def isr(self, _pin):
-        micropython.schedule(self._handle, 0)
+    def isr(self, pin):
+        val = pin.value()  # Захват значения в ISR контексте
+        try:
+            micropython.schedule(self._handle, val)
+        except RuntimeError:
+            pass  # Schedule queue full — пропустить
 
-    def check(self, pin):
-        """Проверить кнопку. Блокирует до отпускания или LONG_PRESS_MS.
-
-        Returns: 'short', 'long', или None.
-        """
-        if not self._pressed:
-            return None
-        start = self._press_time
-        while pin.value() == 0:
-            if time.ticks_diff(time.ticks_ms(), start) >= LONG_PRESS_MS:
-                self._pressed = False
-                return "long"
-            time.sleep_ms(50)
-        self._pressed = False
-        return "short"
+    def check(self, pin=None):
+        """Неблокирующая проверка. Returns: 'short', 'long', или None."""
+        r = self._result
+        if r is not None:
+            self._result = None
+            logger.info("Button: %s", r)
+        return r
 
 
 # =============================================================================
@@ -362,7 +362,9 @@ def tx_main_loop(radio, crypto, oled, bat_monitor, radar, led, flag, trigger):
 
         # ── Кнопка: short=игнор, long=SOS ──────────────────────────
         btn = flag.check(trigger)
-        if btn == "long":
+        if btn == "short":
+            logger.info("Short press ignored (TX active)")
+        elif btn == "long":
             logger.warning("SOS button!")
             p = build_status_payload(bat_monitor, radar)
             p["msg"] = "SOS"
@@ -847,7 +849,7 @@ def main():
 
     flag = TriggerFlag()
     trigger = Pin(TRIGGER_PIN, Pin.IN, Pin.PULL_UP)
-    trigger.irq(flag.isr, trigger=Pin.IRQ_FALLING)
+    trigger.irq(flag.isr, trigger=Pin.IRQ_FALLING | Pin.IRQ_RISING)
 
     i2c = I2C(0, scl=Pin(I2C_SCL), sda=Pin(I2C_SDA), freq=400000)
     oled = OLEDDisplay(i2c)
