@@ -8,6 +8,10 @@ from machine import Pin
 # LED blinks 6x to confirm entry → stays solid while WebREPL is active.
 # Reset the device manually when done uploading files.
 # Normal boot (button not held): falls through, MicroPython loads main.py.
+#
+# Deep sleep wake: skip OTA check entirely — button press is for wake,
+# not OTA entry. Without this, pressing button to wake could accidentally
+# enter OTA mode if held too long.
 # ==============================================================================
 
 OTA_TRIGGER_PIN = 0
@@ -55,16 +59,19 @@ def _ota_mode():
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
-btn = Pin(OTA_TRIGGER_PIN, Pin.IN, Pin.PULL_UP)
 
-if btn.value() == 0:
-    # Button is pressed at boot — wait OTA_HOLD_MS to confirm intent
-    deadline = time.ticks_add(time.ticks_ms(), OTA_HOLD_MS)
-    while time.ticks_diff(deadline, time.ticks_ms()) > 0:
-        if btn.value() != 0:
-            break               # released early → normal boot
-        time.sleep_ms(50)
-    else:
-        _ota_mode()             # held the full duration → enter OTA
+if machine.reset_cause() != machine.DEEPSLEEP_RESET:
+    # Cold boot / hard reset — check for OTA entry
+    btn = Pin(OTA_TRIGGER_PIN, Pin.IN, Pin.PULL_UP)
 
-# Normal boot: fall through here → MicroPython loads main.py next
+    if btn.value() == 0:
+        # Button is pressed at boot — wait OTA_HOLD_MS to confirm intent
+        deadline = time.ticks_add(time.ticks_ms(), OTA_HOLD_MS)
+        while time.ticks_diff(deadline, time.ticks_ms()) > 0:
+            if btn.value() != 0:
+                break           # released early → normal boot
+            time.sleep_ms(50)
+        else:
+            _ota_mode()         # held the full duration → enter OTA
+
+# Deep sleep wake or normal boot: fall through → MicroPython loads main.py

@@ -288,15 +288,22 @@ class LR1121:
         self._wait_busy()
 
         t0 = time.ticks_ms()
+        last_poll = t0
         while not self.dio9_triggered:
             elapsed = time.ticks_diff(time.ticks_ms(), t0)
             if elapsed > timeout_ms:
                 logger.error("⏱ Timeout waiting for TX_DONE.")
                 break
-            # Вызываем callback для прогресс-бара
+            # Поллинг IRQ-регистра каждые 500мс (DIO9 ISR ненадёжен)
+            if time.ticks_diff(time.ticks_ms(), last_poll) >= 500:
+                _, _, poll_irq = self.get_status()
+                if poll_irq & IRQ_TX_DONE:
+                    logger.debug("TX_DONE detected via IRQ poll (%dms)", elapsed)
+                    break
+                last_poll = time.ticks_ms()
             if progress_cb:
                 progress_cb(elapsed)
-            time.sleep_ms(20) # Пауза 20мс, чтобы не спамить экран
+            time.sleep_ms(20)
 
         self._dio9_clear_trigger()
         _, _, irq = self.get_status()
@@ -362,6 +369,13 @@ class LR1121:
     def receive_payload(self, timeout_ms: int = 15000, max_len: int = 255) -> bytes | None:
         self._dio9_clear_trigger()
         self.clear_irq()
+
+        # Восстановить packet params для RX (TX перезаписывает payload_len)
+        preamble, header_type, crc_en, invert_iq = 12, 0x00, 0x01, 0x00
+        self.send_command(
+            LR1121_OP_SET_PACKET_PARAMS,
+            preamble.to_bytes(2, "big") + bytes([header_type, max_len, crc_en, invert_iq]),
+        )
 
         self.set_dio_irq_params(IRQ_RX_DONE | IRQ_TIMEOUT | IRQ_CMD_ERROR | IRQ_ERROR, 0)
         self.clear_irq()
