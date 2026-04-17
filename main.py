@@ -26,6 +26,7 @@ import ntptime
 import time
 import ujson
 
+from lang import set_lang, t
 from lr1121 import LR1121, LR1121_SPI_BAUDRATE
 from oled import OLEDDisplay
 
@@ -43,6 +44,7 @@ WIFI_SSID       = _cfg.get("wifi_ssid", "YOUR_WIFI_NAME")
 WIFI_PASS       = _cfg.get("wifi_pass", "")
 TIMEZONE_OFFSET = _cfg.get("timezone", 2)
 SLEEP_ENABLED   = _cfg.get("sleep", True)
+set_lang(_cfg.get("lang", "ru"))
 
 # --- Драйвер радара (только TX) ---
 if MODE == "TX":
@@ -186,8 +188,7 @@ def format_date_time(timestamp=None):
     if timestamp is None:
         timestamp = time.time()
     local_time = time.localtime(timestamp + (TIMEZONE_OFFSET * 3600))
-    days = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
-    wd = days[local_time[6]]
+    wd = t("days")[local_time[6]]
     date_str = f"{wd} {local_time[2]:02d}.{local_time[1]:02d}.{local_time[0]}"
     time_str = f"{local_time[3]:02d}:{local_time[4]:02d}:{local_time[5]:02d}"
     return date_str, time_str
@@ -197,7 +198,7 @@ def connect_wifi_and_sync(oled):
     """Wi-Fi + NTP sync. Только для RX при холодном старте."""
     if WIFI_SSID == "YOUR_WIFI_NAME":
         logger.warning("Default Wi-Fi — skipping")
-        oled.show_status("WIFI SKIP", "Default config", progress=100)
+        oled.show_status("WIFI SKIP", t("default_cfg"), progress=100)
         time.sleep(1)
         return
 
@@ -229,13 +230,13 @@ def connect_wifi_and_sync(oled):
         time.sleep(1)
         try:
             ntptime.settime()
-            d, t = format_date_time()
-            logger.info("NTP synced: %s %s", d, t)
+            d_s, t_s = format_date_time()
+            logger.info("NTP synced: %s %s", d_s, t_s)
         except Exception as e:
             logger.warning("NTP failed: %s", e)
     else:
         logger.warning("Wi-Fi failed")
-        oled.show_status("WIFI FAIL", "Offline", progress=100)
+        oled.show_status("WIFI FAIL", t("offline"), progress=100)
         time.sleep(1)
 
     if wlan.isconnected():
@@ -243,10 +244,18 @@ def connect_wifi_and_sync(oled):
     wlan.active(False)
 
 
-def blink_ok(led):
-    led.value(1); time.sleep_ms(100); led.value(0)
+def blink_tx_ok(led):
+    """TX завершён — погасить (был включён во время передачи)."""
+    led.value(0)
+
+def blink_rx_ok(led):
+    """Пакет получен — 2 короткие вспышки."""
+    for _ in range(2):
+        led.value(1); time.sleep_ms(80)
+        led.value(0); time.sleep_ms(80)
 
 def blink_fail(led):
+    """Ошибка — 3 быстрых мигания."""
     for _ in range(3):
         led.value(1); time.sleep_ms(50); led.value(0); time.sleep_ms(50)
 
@@ -304,11 +313,12 @@ def send_packet(radio, crypto, payload, led=None):
         return False
 
     logger.info("TX %d bytes: msg=%s", len(encrypted), payload.get("msg"))
+    if led: led.value(1)  # LED ON во время передачи
     ok = radio.transmit_payload(encrypted, timeout_ms=10000)
     if ok:
         tx_counter += 1
         logger.info("TX_DONE #%d", tx_counter)
-        if led: blink_ok(led)
+        if led: blink_tx_ok(led)
     else:
         logger.error("TX timeout")
         if led: blink_fail(led)
@@ -396,7 +406,7 @@ def tx_main_loop(radio, crypto, oled, bat_monitor, radar, led, flag, trigger):
         if (now - last_listen_time) >= TX_LISTEN_INTERVAL_S:
             logger.debug("Listen window %dms", TX_LISTEN_WINDOW_MS)
             v, pct, chrg = bat_monitor.get_status()
-            oled.show_status("LISTEN", "RX cmd...", progress=0, antenna=True,
+            oled.show_status(t("listen"), t("rx_cmd"), progress=0,
                              bat1=pct, bat2=remote_bat_pct, locked=armed)
             msg = receive_packet(radio, crypto, TX_LISTEN_WINDOW_MS)
             if msg:
@@ -409,7 +419,7 @@ def tx_main_loop(radio, crypto, oled, bat_monitor, radar, led, flag, trigger):
             p = build_status_payload(bat_monitor)
             p["msg"] = "Radar Error"
             p["ts"] = -1
-            oled.show_status("CAR ERR", "No radar!", "Sleeping...")
+            oled.show_status("CAR ERR", t("no_radar"), t("sleeping"))
             send_packet(radio, crypto, p, led=led)
             time.sleep(2)
             if SLEEP_ENABLED:
@@ -431,19 +441,19 @@ def tx_main_loop(radio, crypto, oled, bat_monitor, radar, led, flag, trigger):
 
         if idle_elapsed >= TX_IDLE_SLEEP_S:
             logger.info("Idle %ds — sleep", TX_IDLE_SLEEP_S)
-            oled.show_status("SLEEP", "Radar idle", f"{TX_IDLE_SLEEP_S}s")
+            oled.show_status(t("sleep"), t("radar_idle"), f"{TX_IDLE_SLEEP_S}s")
             if SLEEP_ENABLED:
                 go_to_deepsleep(oled=oled, radio=radio)
             else:
                 last_detection_time = time.time()  # Reset idle timer
 
-        ts_map = {0: "Clear", 1: "Moving", 2: "Still", 3: "Mov+Stat"}
+        ts_map = {0: t("clear"), 1: t("moving"), 2: t("still"), 3: t("movstat")}
 
         if not radar.read_frame():
             if time.ticks_diff(time.ticks_ms(), radar_oled_timer) >= RADAR_OLED_MS:
                 state = ts_map.get(radar.target_state, "?")
                 v, pct, chrg = bat_monitor.get_status()
-                oled.show_tx_armed(f"{state} {radar.detection_distance}cm",
+                oled.show_tx_armed(state, f"{radar.detection_distance}cm",
                                    pct, chrg, idle_elapsed, TX_IDLE_SLEEP_S,
                                    tx_counter, remote_bat=remote_bat_pct)
                 radar_oled_timer = time.ticks_ms()
@@ -453,7 +463,7 @@ def tx_main_loop(radio, crypto, oled, bat_monitor, radar, led, flag, trigger):
         if radar.target_state == 0:
             if time.ticks_diff(time.ticks_ms(), radar_oled_timer) >= RADAR_OLED_MS:
                 v, pct, chrg = bat_monitor.get_status()
-                oled.show_tx_armed(f"Clear {radar.detection_distance}cm",
+                oled.show_tx_armed(t("clear"), f"{radar.detection_distance}cm",
                                    pct, chrg, idle_elapsed, TX_IDLE_SLEEP_S,
                                    tx_counter, remote_bat=remote_bat_pct)
                 radar_oled_timer = time.ticks_ms()
@@ -462,7 +472,7 @@ def tx_main_loop(radio, crypto, oled, bat_monitor, radar, led, flag, trigger):
 
         # ── Обнаружен человек! ──────────────────────────────────────
         last_detection_time = time.time()
-        det_map = {1: "Moving", 2: "Still", 3: "Mov+Stat"}
+        det_map = {1: t("moving"), 2: t("still"), 3: t("movstat")}
         state_str = det_map.get(radar.target_state, "?")
         logger.warning("RADAR: %s at %dcm", state_str, radar.detection_distance)
 
@@ -476,7 +486,7 @@ def tx_main_loop(radio, crypto, oled, bat_monitor, radar, led, flag, trigger):
         expected_toa = radio.get_time_on_air_ms(size_est)
         oled.show_status("TX ALARM!", f"{state_str} {radar.detection_distance}cm",
                          f"Pkt#{tx_counter}", f"ToA:{expected_toa/1000:.1f}s",
-                         progress=0, antenna=True)
+                         progress=0, )
 
         last_pct = 0
         def tx_progress(elapsed_ms):
@@ -495,7 +505,7 @@ def tx_main_loop(radio, crypto, oled, bat_monitor, radar, led, flag, trigger):
                 tx_counter += 1
                 last_alarm_time = time.time()
                 logger.info("Alarm OK (%dms)", actual_toa)
-                blink_ok(led)
+                blink_rx_ok(led)
                 time.sleep(2)
             else:
                 logger.error("Alarm TX timeout")
@@ -522,7 +532,7 @@ def _tx_handle_rx_command(msg, radio, crypto, oled, bat_monitor, radar, led):
         p["msg"] = state
         send_packet(radio, crypto, p, led=led)
         v, pct, chrg = bat_monitor.get_status()
-        oled.show_status(state, "From fob", progress=100 if armed else 0,
+        oled.show_status(state, t("from_fob"), progress=100 if armed else 0,
                          bat1=pct, bat2=remote_bat_pct, locked=armed)
         time.sleep(2)
 
@@ -531,7 +541,7 @@ def _tx_handle_rx_command(msg, radio, crypto, oled, bat_monitor, radar, led):
         p = build_status_payload(bat_monitor, radar)
         p["msg"] = "Status"
         send_packet(radio, crypto, p, led=led)
-        blink_ok(led)
+        blink_rx_ok(led)
 
 
 # =============================================================================
@@ -552,6 +562,7 @@ def rx_main_loop(radio, crypto, oled, bat_monitor, led, flag, trigger, wakeup_so
 
     # Main listen loop with chunked receive for button responsiveness
     listen_start = time.ticks_ms()
+    last_heartbeat_ts = 0  # timestamp последнего пульса
 
     while True:
         # Check button
@@ -568,49 +579,72 @@ def rx_main_loop(radio, crypto, oled, bat_monitor, led, flag, trigger, wakeup_so
         # Show idle status
         my_v, my_pct, my_chrg = bat_monitor.get_status()
         d_str, t_str = format_date_time()
+        # Heartbeat: "HH:MM:SS (XXс)"
+        hb_s = ""
+        if last_heartbeat_ts > 0:
+            _, hb_time = format_date_time(last_heartbeat_ts)
+            ago = int(time.time() - last_heartbeat_ts)
+            nxt = max(0, TX_HEARTBEAT_S - ago)
+            hb_s = f"{hb_time} ({nxt}\u0441)"
+        lock_state = armed if last_heartbeat_ts > 0 else None
         oled.show_rx_idle(my_pct, my_chrg, rx_counter, lost_counter,
-                          remote_bat=remote_bat_pct, locked=armed,
-                          date_str=d_str, time_str=t_str)
+                          remote_bat=remote_bat_pct, locked=lock_state,
+                          date_str=d_str, time_str=t_str, hb_str=hb_s)
 
-        # Listen for a chunk
+        # Listen in 1s slices within a chunk (for countdown accuracy)
+        chunk_start = time.ticks_ms()
+        got_packet = False
+        while time.ticks_diff(time.ticks_ms(), chunk_start) < RX_LISTEN_CHUNK_MS:
+            elapsed = time.ticks_diff(time.ticks_ms(), listen_start)
+            if elapsed >= RX_LISTEN_TIMEOUT_MS:
+                break
+            msg = receive_packet(radio, crypto, 1000)
+            if msg is not None:
+                _rx_handle_packet(msg, radio, oled, bat_monitor, led, flag)
+                last_heartbeat_ts = time.time()
+                listen_start = time.ticks_ms()
+                got_packet = True
+                break
+            # Update countdown on screen every second
+            if last_heartbeat_ts > 0:
+                ago = int(time.time() - last_heartbeat_ts)
+                nxt = max(0, TX_HEARTBEAT_S - ago)
+                _, hb_time = format_date_time(last_heartbeat_ts)
+                hb_s = f"{hb_time} ({nxt}\u0441)"
+                oled.show_rx_idle(my_pct, my_chrg, rx_counter, lost_counter,
+                                  remote_bat=remote_bat_pct, locked=armed,
+                                  date_str=d_str, time_str=t_str, hb_str=hb_s)
+
+        # Timeout check
         elapsed = time.ticks_diff(time.ticks_ms(), listen_start)
-        remaining = RX_LISTEN_TIMEOUT_MS - elapsed
-        if remaining <= 0:
+        if elapsed >= RX_LISTEN_TIMEOUT_MS:
             if SLEEP_ENABLED:
                 logger.info("RX timeout — sleep")
-                oled.show_status("SLEEP", "Zzzz...")
+                oled.show_status(t("sleep"), t("zzzz"))
                 sleep_ms = RX_SLEEP_INTERVAL_S * 1000 if RX_SLEEP_INTERVAL_S > 0 else 0
                 go_to_deepsleep(oled=oled, radio=radio, sleep_ms=sleep_ms)
                 return
             else:
                 logger.debug("RX timeout — restart (sleep disabled)")
                 listen_start = time.ticks_ms()
-                continue
-        chunk = min(remaining, RX_LISTEN_CHUNK_MS)
-        msg = receive_packet(radio, crypto, chunk)
-
-        if msg is not None:
-            _rx_handle_packet(msg, radio, oled, bat_monitor, led)
-            listen_start = time.ticks_ms()  # Reset timeout
 
 
 def _rx_send_arm(radio, crypto, oled, bat_monitor, led):
     """Отправить toggle arm/disarm на TX, дождаться подтверждения."""
     logger.info("Sending Arm toggle...")
     v, pct, chrg = bat_monitor.get_status()
-    oled.show_status("ARM", "Sending...", progress=0, antenna=True,
-                     bat1=pct, bat2=remote_bat_pct)
+    oled.show_status(t("arm"), t("sending"), progress=0,                      bat1=pct, bat2=remote_bat_pct)
 
     p = {"msg": "Arm", "t": time.time(), "c": tx_counter,
          "v": v, "b": pct, "ch": chrg, "ts": 0, "dd": 0}
     ok = send_packet(radio, crypto, p, led=led)
     if not ok:
-        oled.show_status("ARM FAIL", "TX error", progress=0)
+        oled.show_status("ARM FAIL", t("tx_error"), progress=0)
         time.sleep(2)
         return
 
-    oled.show_status("WAITING", "Confirm...", f"{RX_PING_TIMEOUT_MS//1000}s",
-                     progress=50, antenna=True, bat1=pct, bat2=remote_bat_pct)
+    oled.show_status(t("wait"), t("confirm"), f"{RX_PING_TIMEOUT_MS//1000}s",
+                     progress=50, bat1=pct, bat2=remote_bat_pct)
     # Retry до получения Armed/Disarmed (TX может отправить другие пакеты первыми)
     t_wait = time.ticks_ms()
     confirmed = False
@@ -626,14 +660,14 @@ def _rx_send_arm(radio, crypto, oled, bat_monitor, led):
                 global armed
                 armed = resp.get("armed", True)
                 _rx_display_status(resp, radio, oled, bat_monitor)
-                blink_ok(led)
+                blink_rx_ok(led)
                 confirmed = True
                 break
             else:
                 logger.info("Got '%s' while waiting for arm confirm", resp.get("msg"))
     if not confirmed:
         logger.warning("No arm confirmation")
-        oled.show_status("NO ANSWER", "Car offline?", progress=0)
+        oled.show_status(t("no_answer"), t("car_offline"), progress=0)
         blink_fail(led)
     time.sleep(3)
 
@@ -642,19 +676,18 @@ def _rx_send_ping(radio, crypto, oled, bat_monitor, led):
     """Отправить ping на TX, дождаться статуса."""
     logger.info("Sending Ping...")
     v, pct, chrg = bat_monitor.get_status()
-    oled.show_status("PING", "Requesting...", progress=0, antenna=True,
-                     bat1=pct, bat2=remote_bat_pct)
+    oled.show_status(t("ping"), t("requesting"), progress=0,                      bat1=pct, bat2=remote_bat_pct)
 
     p = {"msg": "Ping", "t": time.time(), "c": tx_counter,
          "v": v, "b": pct, "ch": chrg, "ts": 0, "dd": 0}
     ok = send_packet(radio, crypto, p, led=led)
     if not ok:
-        oled.show_status("PING FAIL", "TX error", progress=0)
+        oled.show_status("PING FAIL", t("tx_error"), progress=0)
         time.sleep(2)
         return
 
-    oled.show_status("WAITING", "Response...", f"{RX_PING_TIMEOUT_MS//1000}s",
-                     progress=50, antenna=True)
+    oled.show_status(t("wait"), t("response"), f"{RX_PING_TIMEOUT_MS//1000}s",
+                     progress=50, )
     t_wait = time.ticks_ms()
     confirmed = False
     while time.ticks_diff(time.ticks_ms(), t_wait) < RX_PING_TIMEOUT_MS:
@@ -667,17 +700,17 @@ def _rx_send_ping(radio, crypto, oled, bat_monitor, led):
             _sync_time_from_packet(resp)
             if resp.get("msg") in ("Status", "Heartbeat", "Armed", "Disarmed"):
                 _rx_display_status(resp, radio, oled, bat_monitor)
-                blink_ok(led)
+                blink_rx_ok(led)
                 confirmed = True
                 break
     if not confirmed:
         logger.warning("No ping response")
-        oled.show_status("NO ANSWER", "Car offline?", progress=0)
+        oled.show_status(t("no_answer"), t("car_offline"), progress=0)
         blink_fail(led)
     time.sleep(3)
 
 
-def _rx_handle_packet(msg, radio, oled, bat_monitor, led):
+def _rx_handle_packet(msg, radio, oled, bat_monitor, led, flag):
     """Обработать пакет на RX: alarm, heartbeat, status, SOS."""
     global rx_counter, lost_counter, expected_c, armed
 
@@ -687,7 +720,7 @@ def _rx_handle_packet(msg, radio, oled, bat_monitor, led):
     dd_val   = msg.get("dd", 0)
     is_armed = msg.get("armed", True)
 
-    ts_map = {-2: "Vibr!", -1: "NoRadar", 0: "None", 1: "Moving", 2: "Still", 3: "Both"}
+    ts_map = {-2: t("vibr"), -1: t("no_rdr"), 0: t("none"), 1: t("moving"), 2: t("still"), 3: t("both")}
     ts_str = ts_map.get(ts_val, "?")
 
     logger.info("RX: '%s' #%d ts=%s dd=%d armed=%s", msg_type, c_val, ts_str, dd_val, is_armed)
@@ -709,7 +742,7 @@ def _rx_handle_packet(msg, radio, oled, bat_monitor, led):
     rssi = getattr(radio, 'last_rssi', 0)
     snr  = getattr(radio, 'last_snr', 0)
 
-    # SOS — экстренный сигнал
+    # SOS — экстренный сигнал (остаётся пока не нажмут кнопку)
     if msg_type == "SOS":
         my_v, my_pct, my_chrg = bat_monitor.get_status()
         car_pct = msg.get("b", 0)
@@ -717,20 +750,23 @@ def _rx_handle_packet(msg, radio, oled, bat_monitor, led):
             signal_str=f"R:{rssi:.0f} S:{snr:.1f}",
             car_pct=car_pct, car_charging=bool(msg.get("ch", False)),
             my_pct=my_pct, my_charging=my_chrg,
-            radar_str="EMERGENCY!", stats_str="SOS from car!",
+            radar_str=t("emergency"), stats_str=t("sos_car"),
             is_sos=True,
         )
-        for _ in range(10):
+        # Мигаем + ждём нажатия кнопки
+        btn_pin = Pin(TRIGGER_PIN, Pin.IN, Pin.PULL_UP)
+        while True:
             led.value(1); time.sleep_ms(200)
             led.value(0); time.sleep_ms(200)
-        time.sleep(3)
+            if flag.check() is not None:
+                break
         return
 
     # Информативные пакеты
     if msg_type in ("Heartbeat", "Status", "Armed", "Disarmed"):
         _rx_display_status(msg, radio, oled, bat_monitor)
-        blink_ok(led)
-        time.sleep(3)
+        blink_rx_ok(led)
+        time.sleep(10 if msg_type == "Heartbeat" else 3)
         return
 
     # Тревожные пакеты
@@ -749,7 +785,7 @@ def _rx_handle_packet(msg, radio, oled, bat_monitor, led):
         radar_str=f"{ts_str} {dd_val}cm",
         stats_str=f"{time_str[:5]} RX:{rx_counter} L:{lost_counter}",
     )
-    blink_ok(led)
+    blink_rx_ok(led)
     time.sleep(5)
 
 
@@ -764,15 +800,16 @@ def _rx_display_status(msg, radio, oled, bat_monitor):
     snr      = getattr(radio, 'last_snr', 0)
     my_v, my_pct, my_chrg = bat_monitor.get_status()
 
-    ts_map = {-2: "Vibr!", -1: "NoRdr", 0: "Clear", 1: "Mov", 2: "Stat", 3: "Both"}
+    ts_map = {-2: t("vibr"), -1: t("no_rdr"), 0: t("clear"), 1: t("moving"), 2: t("still"), 3: t("both")}
     ts_str = ts_map.get(ts_val, "?")
 
     oled.show_rx_box(
-        title=msg_type[:7],
-        message=f"{'ARMED' if is_armed else 'DISARM'} {ts_str}",
+        title=t("msg_" + msg_type)[:7] if msg_type else "?",
+        arm_str=t('armed') if is_armed else t('disarmed'),
+        radar_str=ts_str,
         signal_str=f"R:{rssi:.0f} S:{snr:.1f}",
-        date_str=f"{ts_str} {dd_val}cm",
-        stats_str=f"RX:{rx_counter} L:{lost_counter}",
+        distance=f"{dd_val}cm",
+        stats_str=f"{t('rx_lbl')}:{rx_counter} {t('lost_lbl')}:{lost_counter}",
         bat1=my_pct, bat2=car_pct,
         locked=is_armed,
     )
@@ -854,7 +891,7 @@ def main():
     i2c = I2C(0, scl=Pin(I2C_SCL), sda=Pin(I2C_SDA), freq=400000)
     oled = OLEDDisplay(i2c)
 
-    display_name = "CAR" if MODE == "TX" else "YOU"
+    display_name = t("car") if MODE == "TX" else t("you")
 
     # Cold boot: splash screen
     if not is_deepsleep:
@@ -865,7 +902,7 @@ def main():
     if wakeup_source == "button" and not button_long and MODE == "TX":
         v, pct, chrg = bat_monitor.get_status()
         _, t_str = format_date_time()
-        oled.show_brief_status("CAR", pct, chrg, armed, t_str,
+        oled.show_brief_status(t("car"), pct, chrg, armed, t_str,
                                remote_bat=remote_bat_pct)
         # Quick radio init for continuous RX in next sleep
         spi = SPI(1, baudrate=LR1121_SPI_BAUDRATE, polarity=0, phase=0,
@@ -884,7 +921,7 @@ def main():
         try:
             radar = LD2410B(uart_id=RADAR_UART_ID, tx_pin=RADAR_TX_PIN, rx_pin=RADAR_RX_PIN)
             logger.info("Probing radar %dms...", RADAR_CHECK_MS)
-            oled.show_status("RADAR", "Checking...", progress=20)
+            oled.show_status("RADAR", t("checking"), progress=20)
             radar_ok = False
             t0 = time.ticks_ms()
             while time.ticks_diff(time.ticks_ms(), t0) < RADAR_CHECK_MS:
@@ -959,7 +996,7 @@ def main():
         p = build_status_payload(bat_monitor, radar)
         p["msg"] = "Vibration!"
         p["ts"] = -2
-        oled.show_status("VIBR!", "Shock alarm", antenna=True)
+        oled.show_status(t("vibr"), t("shock_alarm"))
         send_packet(radio, crypto, p, led=led)
         time.sleep(2)
 
@@ -975,7 +1012,7 @@ def main():
                     break
                 time.sleep_ms(50)
         p["msg"] = "Alarm!"
-        oled.show_status("ALARM!", "Radar wake", antenna=True)
+        oled.show_status(t("alarm"), t("radar_wake"))
         send_packet(radio, crypto, p, led=led)
         time.sleep(2)
 
@@ -983,7 +1020,7 @@ def main():
     if MODE == "TX" and wakeup_source in ("vibration", "radar_out") and not armed:
         logger.info("Disarmed, ignoring sensor → sleep")
         v, pct, chrg = bat_monitor.get_status()
-        oled.show_brief_status("CAR", pct, chrg, armed, "", remote_bat=remote_bat_pct)
+        oled.show_brief_status(t("car"), pct, chrg, armed, "", remote_bat=remote_bat_pct)
         time.sleep(2)
         if SLEEP_ENABLED:
             go_to_deepsleep(oled=oled, radio=radio)
@@ -1002,7 +1039,7 @@ def main():
     # === Ready ===
     v, pct, chrg = bat_monitor.get_status()
     oled.show_status(f"{display_name} OK", f"v{FIRMWARE_VERSION}", progress=100,
-                     antenna=True, bat1=pct, bat2=remote_bat_pct, locked=armed)
+                     bat1=pct, bat2=remote_bat_pct, locked=armed)
     time.sleep(1)
 
     # === Main loop ===
@@ -1016,10 +1053,12 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
+        import sys
+        sys.print_exception(e)
         logger.exception("FATAL: %s", str(e))
         try:
             i2c = I2C(0, scl=Pin(I2C_SCL), sda=Pin(I2C_SDA), freq=400000)
             oled = OLEDDisplay(i2c)
-            oled.show_status("CRASHED", "See console", str(e)[:15])
+            oled.show_status("CRASHED", t("see_console"), str(e)[:15])
         except:
             pass
