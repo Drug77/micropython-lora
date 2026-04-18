@@ -209,16 +209,22 @@ def connect_wifi_and_sync(oled):
         wlan.disconnect()
         time.sleep_ms(200)
 
+    ssid_short = WIFI_SSID[:8]
     for attempt in range(1, 4):
         logger.info("Wi-Fi attempt %d/3...", attempt)
-        oled.show_status("WIFI", f"Attempt {attempt}/3", WIFI_SSID[:15], progress=attempt * 33)
+        base_pct = (attempt - 1) * 30
+        oled.show_send_progress("WIFI", ssid_short, base_pct,
+                                f"{attempt}/3", header=t("you"))
         try:
             wlan.connect(WIFI_SSID, WIFI_PASS)
         except OSError as e:
             logger.error("Wi-Fi error: %s", e)
-        for _ in range(50):
+            continue
+        for i in range(50):  # 50 × 100ms = 5s
             if wlan.isconnected():
                 break
+            pct = base_pct + (i + 1) * 30 // 50
+            oled.update_send_bar(pct, f"{(i + 1) // 10}\u0441")
             time.sleep_ms(100)
         if wlan.isconnected():
             break
@@ -226,14 +232,17 @@ def connect_wifi_and_sync(oled):
     if wlan.isconnected():
         ip = wlan.ifconfig()[0]
         logger.info("Wi-Fi OK: %s", ip)
-        oled.show_status("WIFI OK", ip, progress=90)
-        time.sleep(1)
+        oled.show_send_progress("WIFI OK", ip[:8], 90, "NTP...",
+                                header=t("you"))
         try:
             ntptime.settime()
             d_s, t_s = format_date_time()
             logger.info("NTP synced: %s %s", d_s, t_s)
+            oled.update_send_bar(100, "OK")
         except Exception as e:
             logger.warning("NTP failed: %s", e)
+            oled.update_send_bar(100, "NTP!")
+        time.sleep(1)
     else:
         logger.warning("Wi-Fi failed")
         oled.show_status("WIFI FAIL", t("offline"), progress=100)
@@ -265,23 +274,25 @@ class TriggerFlag:
 
     ISR захватывает pin.value() синхронно, schedule обрабатывает.
     FALLING: записывает время. RISING: вычисляет длительность.
-    check() неблокирующий.
+    check(): long press срабатывает БЕЗ отпускания (по таймауту удержания).
     """
     def __init__(self):
         self._result = None
         self._press_time = 0
+        self._long_fired = False
 
     def _handle(self, val):
         now = time.ticks_ms()
         if val == 0:
             # Кнопка нажата
             self._press_time = now
+            self._long_fired = False
         else:
             # Кнопка отпущена
-            if self._press_time > 0:
-                duration = time.ticks_diff(now, self._press_time)
-                self._result = "long" if duration >= LONG_PRESS_MS else "short"
-                self._press_time = 0
+            if self._press_time > 0 and not self._long_fired:
+                self._result = "short"
+            self._press_time = 0
+            self._long_fired = False
 
     def isr(self, pin):
         val = pin.value()  # Захват значения в ISR контексте
@@ -291,7 +302,15 @@ class TriggerFlag:
             pass  # Schedule queue full — пропустить
 
     def check(self, pin=None):
-        """Неблокирующая проверка. Returns: 'short', 'long', или None."""
+        """Неблокирующая проверка. Returns: 'short', 'long', или None.
+        Long press fires while button is still held (no release needed).
+        """
+        # Long press detection: button held >= LONG_PRESS_MS
+        if self._press_time > 0 and not self._long_fired:
+            duration = time.ticks_diff(time.ticks_ms(), self._press_time)
+            if duration >= LONG_PRESS_MS:
+                self._long_fired = True
+                self._result = "long"
         r = self._result
         if r is not None:
             self._result = None
@@ -303,7 +322,7 @@ class TriggerFlag:
 # Коммуникация
 # =============================================================================
 
-def send_packet(radio, crypto, payload, led=None):
+def send_packet(radio, crypto, payload, led=None, progress_cb=None):
     """Зашифровать и отправить payload по LoRa."""
     global tx_counter
     encrypted = crypto.encrypt_json(payload)
@@ -314,7 +333,7 @@ def send_packet(radio, crypto, payload, led=None):
 
     logger.info("TX %d bytes: msg=%s", len(encrypted), payload.get("msg"))
     if led: led.value(1)  # LED ON во время передачи
-    ok = radio.transmit_payload(encrypted, timeout_ms=10000)
+    ok = radio.transmit_payload(encrypted, timeout_ms=10000, progress_cb=progress_cb)
     if ok:
         tx_counter += 1
         logger.info("TX_DONE #%d", tx_counter)
@@ -361,7 +380,7 @@ def tx_main_loop(radio, crypto, oled, bat_monitor, radar, led, flag, trigger):
 
     last_alarm_time = 0
     last_detection_time = time.time()
-    last_heartbeat_time = time.time()
+    last_heartbeat_time = 0  # первый heartbeat сразу при cold boot
     last_listen_time = time.time()
     radar_oled_timer = time.ticks_ms()
 
@@ -394,21 +413,53 @@ def tx_main_loop(radio, crypto, oled, bat_monitor, radar, led, flag, trigger):
                 send_packet(radio, crypto, p, led=led)
                 last_heartbeat_time = time.time()
 
-            # Always listen (no gaps)
+            # Listen in 1s slices (SOS button responsive)
             v, pct, chrg = bat_monitor.get_status()
-            oled.show_tx_disarmed(pct, chrg, tx_counter, remote_bat=remote_bat_pct)
-            msg = receive_packet(radio, crypto, TX_LISTEN_WINDOW_MS)
+            hb_cd = max(0, TX_HEARTBEAT_S - int(time.time() - last_heartbeat_time))
+            oled.show_tx_disarmed(pct, chrg, tx_counter, remote_bat=remote_bat_pct,
+                                  hb_countdown=hb_cd)
+            msg = None
+            for _ in range(TX_LISTEN_WINDOW_MS // 1000):
+                btn = flag.check()
+                if btn == "long":
+                    logger.warning("SOS button!")
+                    p = build_status_payload(bat_monitor, radar)
+                    p["msg"] = "SOS"
+                    oled.show_sos_sent(pct, remote_bat=remote_bat_pct)
+                    send_packet(radio, crypto, p, led=led)
+                    time.sleep(3)
+                    if SLEEP_ENABLED:
+                        go_to_deepsleep(oled=oled, radio=radio)
+                    break
+                msg = receive_packet(radio, crypto, 1000)
+                if msg:
+                    break
             if msg:
                 _tx_handle_rx_command(msg, radio, crypto, oled, bat_monitor, radar, led)
             continue
 
-        # ── ARMED: periodic listen window ───────────────────────────
+        # ── ARMED: periodic listen window (1s slices for SOS) ───────
         if (now - last_listen_time) >= TX_LISTEN_INTERVAL_S:
             logger.debug("Listen window %dms", TX_LISTEN_WINDOW_MS)
             v, pct, chrg = bat_monitor.get_status()
             oled.show_status(t("listen"), t("rx_cmd"), progress=0,
                              bat1=pct, bat2=remote_bat_pct, locked=armed)
-            msg = receive_packet(radio, crypto, TX_LISTEN_WINDOW_MS)
+            msg = None
+            for _ in range(TX_LISTEN_WINDOW_MS // 1000):
+                btn = flag.check()
+                if btn == "long":
+                    logger.warning("SOS button!")
+                    p = build_status_payload(bat_monitor, radar)
+                    p["msg"] = "SOS"
+                    oled.show_sos_sent(pct, remote_bat=remote_bat_pct)
+                    send_packet(radio, crypto, p, led=led)
+                    time.sleep(3)
+                    if SLEEP_ENABLED:
+                        go_to_deepsleep(oled=oled, radio=radio)
+                    break
+                msg = receive_packet(radio, crypto, 1000)
+                if msg:
+                    break
             if msg:
                 _tx_handle_rx_command(msg, radio, crypto, oled, bat_monitor, radar, led)
             last_listen_time = time.time()
@@ -453,9 +504,11 @@ def tx_main_loop(radio, crypto, oled, bat_monitor, radar, led, flag, trigger):
             if time.ticks_diff(time.ticks_ms(), radar_oled_timer) >= RADAR_OLED_MS:
                 state = ts_map.get(radar.target_state, "?")
                 v, pct, chrg = bat_monitor.get_status()
+                hb_cd = max(0, TX_HEARTBEAT_S - int(now - last_heartbeat_time))
                 oled.show_tx_armed(state, f"{radar.detection_distance}cm",
                                    pct, chrg, idle_elapsed, TX_IDLE_SLEEP_S,
-                                   tx_counter, remote_bat=remote_bat_pct)
+                                   tx_counter, remote_bat=remote_bat_pct,
+                                   hb_countdown=hb_cd)
                 radar_oled_timer = time.ticks_ms()
             time.sleep_ms(RADAR_POLL_MS)
             continue
@@ -463,9 +516,11 @@ def tx_main_loop(radio, crypto, oled, bat_monitor, radar, led, flag, trigger):
         if radar.target_state == 0:
             if time.ticks_diff(time.ticks_ms(), radar_oled_timer) >= RADAR_OLED_MS:
                 v, pct, chrg = bat_monitor.get_status()
+                hb_cd = max(0, TX_HEARTBEAT_S - int(now - last_heartbeat_time))
                 oled.show_tx_armed(t("clear"), f"{radar.detection_distance}cm",
                                    pct, chrg, idle_elapsed, TX_IDLE_SLEEP_S,
-                                   tx_counter, remote_bat=remote_bat_pct)
+                                   tx_counter, remote_bat=remote_bat_pct,
+                                   hb_countdown=hb_cd)
                 radar_oled_timer = time.ticks_ms()
             time.sleep_ms(RADAR_POLL_MS)
             continue
@@ -552,48 +607,52 @@ def rx_main_loop(radio, crypto, oled, bat_monitor, led, flag, trigger, wakeup_so
     """RX main loop: listen for TX, arm/ping on button, deep sleep on timeout."""
     global rx_counter, lost_counter, expected_c
 
-    # Wake dispatch: button or timer
+    # Wake dispatch: button, timer, or cold boot auto-ping
+    link_ok = False
     if wakeup_source == "button_short":
-        _rx_send_arm(radio, crypto, oled, bat_monitor, led)
+        link_ok = _rx_send_arm(radio, crypto, oled, bat_monitor, led)
     elif wakeup_source == "button_long":
-        _rx_send_ping(radio, crypto, oled, bat_monitor, led)
-    elif wakeup_source == "timer":
-        _rx_send_ping(radio, crypto, oled, bat_monitor, led)
+        link_ok = _rx_send_ping(radio, crypto, oled, bat_monitor, led)
+    elif wakeup_source == "timer" or wakeup_source is None:
+        link_ok = _rx_send_ping(radio, crypto, oled, bat_monitor, led)
 
     # Main listen loop with chunked receive for button responsiveness
     listen_start = time.ticks_ms()
-    last_heartbeat_ts = 0  # timestamp последнего пульса
+    last_heartbeat_ts = time.time() if link_ok else 0
 
     while True:
         # Check button
         btn = flag.check(trigger)
         if btn == "short":
-            _rx_send_arm(radio, crypto, oled, bat_monitor, led)
+            if _rx_send_arm(radio, crypto, oled, bat_monitor, led):
+                last_heartbeat_ts = time.time()
             listen_start = time.ticks_ms()
             continue
         elif btn == "long":
-            _rx_send_ping(radio, crypto, oled, bat_monitor, led)
+            if _rx_send_ping(radio, crypto, oled, bat_monitor, led):
+                last_heartbeat_ts = time.time()
             listen_start = time.ticks_ms()
             continue
 
         # Show idle status
         my_v, my_pct, my_chrg = bat_monitor.get_status()
         d_str, t_str = format_date_time()
-        # Heartbeat: "HH:MM:SS (XXс)"
         hb_s = ""
+        hb_pct = 0
         if last_heartbeat_ts > 0:
-            _, hb_time = format_date_time(last_heartbeat_ts)
             ago = int(time.time() - last_heartbeat_ts)
             nxt = max(0, TX_HEARTBEAT_S - ago)
-            hb_s = f"{hb_time} ({nxt}\u0441)"
+            hb_s = f"{nxt}\u0441"
+            hb_pct = min(ago * 100 // TX_HEARTBEAT_S, 100)
         lock_state = armed if last_heartbeat_ts > 0 else None
         oled.show_rx_idle(my_pct, my_chrg, rx_counter, lost_counter,
                           remote_bat=remote_bat_pct, locked=lock_state,
-                          date_str=d_str, time_str=t_str, hb_str=hb_s)
+                          date_str=d_str, time_str=t_str, hb_str=hb_s,
+                          hb_pct=hb_pct)
 
         # Listen in 1s slices within a chunk (for countdown accuracy)
         chunk_start = time.ticks_ms()
-        got_packet = False
+        inner_btn = None
         while time.ticks_diff(time.ticks_ms(), chunk_start) < RX_LISTEN_CHUNK_MS:
             elapsed = time.ticks_diff(time.ticks_ms(), listen_start)
             if elapsed >= RX_LISTEN_TIMEOUT_MS:
@@ -603,17 +662,32 @@ def rx_main_loop(radio, crypto, oled, bat_monitor, led, flag, trigger, wakeup_so
                 _rx_handle_packet(msg, radio, oled, bat_monitor, led, flag)
                 last_heartbeat_ts = time.time()
                 listen_start = time.ticks_ms()
-                got_packet = True
+                break
+            # Check button between receive slices (~1s latency max)
+            inner_btn = flag.check()
+            if inner_btn is not None:
                 break
             # Update countdown on screen every second
             if last_heartbeat_ts > 0:
                 ago = int(time.time() - last_heartbeat_ts)
                 nxt = max(0, TX_HEARTBEAT_S - ago)
-                _, hb_time = format_date_time(last_heartbeat_ts)
-                hb_s = f"{hb_time} ({nxt}\u0441)"
+                hb_s = f"{nxt}\u0441"
+                hb_pct = min(ago * 100 // TX_HEARTBEAT_S, 100)
                 oled.show_rx_idle(my_pct, my_chrg, rx_counter, lost_counter,
                                   remote_bat=remote_bat_pct, locked=armed,
-                                  date_str=d_str, time_str=t_str, hb_str=hb_s)
+                                  date_str=d_str, time_str=t_str, hb_str=hb_s,
+                                  hb_pct=hb_pct)
+
+        # Handle button from inner loop
+        if inner_btn is not None:
+            if inner_btn == "short":
+                if _rx_send_arm(radio, crypto, oled, bat_monitor, led):
+                    last_heartbeat_ts = time.time()
+            elif inner_btn == "long":
+                if _rx_send_ping(radio, crypto, oled, bat_monitor, led):
+                    last_heartbeat_ts = time.time()
+            listen_start = time.ticks_ms()
+            continue
 
         # Timeout check
         elapsed = time.ticks_diff(time.ticks_ms(), listen_start)
@@ -633,26 +707,41 @@ def _rx_send_arm(radio, crypto, oled, bat_monitor, led):
     """Отправить toggle arm/disarm на TX, дождаться подтверждения."""
     logger.info("Sending Arm toggle...")
     v, pct, chrg = bat_monitor.get_status()
-    oled.show_status(t("arm"), t("sending"), progress=0,                      bat1=pct, bat2=remote_bat_pct)
+
+    # ToA progress bar
+    toa_ms = radio.get_time_on_air_ms(128)
+    toa_str = f"~{toa_ms // 1000}\u0441"
+    oled.show_send_progress(t("arm"), t("sending"), 0, toa_str,
+                            bat1=pct, bat2=remote_bat_pct)
+
+    last_pct = [0]
+    def tx_progress(elapsed_ms):
+        p = min(int((elapsed_ms / toa_ms) * 100), 99)
+        if p - last_pct[0] >= 3:
+            oled.update_send_bar(p, f"{elapsed_ms // 1000}\u0441")
+            last_pct[0] = p
 
     p = {"msg": "Arm", "t": time.time(), "c": tx_counter,
          "v": v, "b": pct, "ch": chrg, "ts": 0, "dd": 0}
-    ok = send_packet(radio, crypto, p, led=led)
+    ok = send_packet(radio, crypto, p, led=led, progress_cb=tx_progress)
     if not ok:
         oled.show_status("ARM FAIL", t("tx_error"), progress=0)
         time.sleep(2)
         return
 
-    oled.show_status(t("wait"), t("confirm"), f"{RX_PING_TIMEOUT_MS//1000}s",
-                     progress=50, bat1=pct, bat2=remote_bat_pct)
-    # Retry до получения Armed/Disarmed (TX может отправить другие пакеты первыми)
+    wait_str = f"{RX_PING_TIMEOUT_MS // 1000}\u0441"
+    oled.show_send_progress(t("arm"), t("confirm"), 0, wait_str,
+                            bat1=pct, bat2=remote_bat_pct)
     t_wait = time.ticks_ms()
     confirmed = False
     while time.ticks_diff(time.ticks_ms(), t_wait) < RX_PING_TIMEOUT_MS:
         remaining = RX_PING_TIMEOUT_MS - time.ticks_diff(time.ticks_ms(), t_wait)
         if remaining <= 0:
             break
-        resp = receive_packet(radio, crypto, min(remaining, 10000))
+        elapsed_w = time.ticks_diff(time.ticks_ms(), t_wait)
+        wp = min(int((elapsed_w / RX_PING_TIMEOUT_MS) * 100), 99)
+        oled.update_send_bar(wp, f"{elapsed_w // 1000}\u0441")
+        resp = receive_packet(radio, crypto, min(remaining, 1000))
         if resp:
             _update_remote_battery(resp)
             _sync_time_from_packet(resp)
@@ -670,35 +759,54 @@ def _rx_send_arm(radio, crypto, oled, bat_monitor, led):
         oled.show_status(t("no_answer"), t("car_offline"), progress=0)
         blink_fail(led)
     time.sleep(3)
+    return confirmed
 
 
 def _rx_send_ping(radio, crypto, oled, bat_monitor, led):
     """Отправить ping на TX, дождаться статуса."""
     logger.info("Sending Ping...")
     v, pct, chrg = bat_monitor.get_status()
-    oled.show_status(t("ping"), t("requesting"), progress=0,                      bat1=pct, bat2=remote_bat_pct)
+
+    # ToA progress bar
+    toa_ms = radio.get_time_on_air_ms(128)
+    toa_str = f"~{toa_ms // 1000}\u0441"
+    oled.show_send_progress(t("ping"), t("requesting"), 0, toa_str,
+                            bat1=pct, bat2=remote_bat_pct)
+
+    last_pct = [0]
+    def tx_progress(elapsed_ms):
+        p = min(int((elapsed_ms / toa_ms) * 100), 99)
+        if p - last_pct[0] >= 3:
+            oled.update_send_bar(p, f"{elapsed_ms // 1000}\u0441")
+            last_pct[0] = p
 
     p = {"msg": "Ping", "t": time.time(), "c": tx_counter,
          "v": v, "b": pct, "ch": chrg, "ts": 0, "dd": 0}
-    ok = send_packet(radio, crypto, p, led=led)
+    ok = send_packet(radio, crypto, p, led=led, progress_cb=tx_progress)
     if not ok:
         oled.show_status("PING FAIL", t("tx_error"), progress=0)
         time.sleep(2)
         return
 
-    oled.show_status(t("wait"), t("response"), f"{RX_PING_TIMEOUT_MS//1000}s",
-                     progress=50, )
+    wait_str = f"{RX_PING_TIMEOUT_MS // 1000}\u0441"
+    oled.show_send_progress(t("ping"), t("response"), 0, wait_str,
+                            bat1=pct, bat2=remote_bat_pct)
     t_wait = time.ticks_ms()
     confirmed = False
     while time.ticks_diff(time.ticks_ms(), t_wait) < RX_PING_TIMEOUT_MS:
         remaining = RX_PING_TIMEOUT_MS - time.ticks_diff(time.ticks_ms(), t_wait)
         if remaining <= 0:
             break
-        resp = receive_packet(radio, crypto, min(remaining, 10000))
+        elapsed_w = time.ticks_diff(time.ticks_ms(), t_wait)
+        wp = min(int((elapsed_w / RX_PING_TIMEOUT_MS) * 100), 99)
+        oled.update_send_bar(wp, f"{elapsed_w // 1000}\u0441")
+        resp = receive_packet(radio, crypto, min(remaining, 1000))
         if resp:
             _update_remote_battery(resp)
             _sync_time_from_packet(resp)
             if resp.get("msg") in ("Status", "Heartbeat", "Armed", "Disarmed"):
+                global armed
+                armed = resp.get("armed", armed)
                 _rx_display_status(resp, radio, oled, bat_monitor)
                 blink_rx_ok(led)
                 confirmed = True
@@ -708,6 +816,7 @@ def _rx_send_ping(radio, crypto, oled, bat_monitor, led):
         oled.show_status(t("no_answer"), t("car_offline"), progress=0)
         blink_fail(led)
     time.sleep(3)
+    return confirmed
 
 
 def _rx_handle_packet(msg, radio, oled, bat_monitor, led, flag):
@@ -746,12 +855,16 @@ def _rx_handle_packet(msg, radio, oled, bat_monitor, led, flag):
     if msg_type == "SOS":
         my_v, my_pct, my_chrg = bat_monitor.get_status()
         car_pct = msg.get("b", 0)
+        d_s, t_s = format_date_time()
+        # Compact datetime: "Пт.14:23"
+        sos_dt = f"{d_s.split()[0]}.{t_s[:5]}"
         oled.show_rx_alarm(
             signal_str=f"R:{rssi:.0f} S:{snr:.1f}",
             car_pct=car_pct, car_charging=bool(msg.get("ch", False)),
             my_pct=my_pct, my_charging=my_chrg,
-            radar_str=t("emergency"), stats_str=t("sos_car"),
-            is_sos=True,
+            radar_str=t("emergency"),
+            stats_str=f"{t('rx_lbl')}:{rx_counter}",
+            is_sos=True, date_str=sos_dt, time_str="",
         )
         # Мигаем + ждём нажатия кнопки
         btn_pin = Pin(TRIGGER_PIN, Pin.IN, Pin.PULL_UP)
@@ -769,7 +882,22 @@ def _rx_handle_packet(msg, radio, oled, bat_monitor, led, flag):
         time.sleep(10 if msg_type == "Heartbeat" else 3)
         return
 
-    # Тревожные пакеты
+    # Radar Error от TX — ошибка радара, авто-снятие с охраны
+    if msg_type == "Radar Error":
+        armed = False
+        my_v, my_pct, my_chrg = bat_monitor.get_status()
+        car_pct = msg.get("b", 0)
+        oled.show_status(t("car"), t("no_radar"), t("car_offline"),
+                         bat1=my_pct, bat2=car_pct, locked=False)
+        # Критическое — ждём кнопку
+        while True:
+            led.value(1); time.sleep_ms(200)
+            led.value(0); time.sleep_ms(200)
+            if flag.check() is not None:
+                break
+        return
+
+    # Тревожные пакеты — критические, убираются кнопкой
     t_val = msg.get("t", 0)
     _, time_str = format_date_time(t_val)
     car_pct = msg.get("b", 0)
@@ -785,8 +913,12 @@ def _rx_handle_packet(msg, radio, oled, bat_monitor, led, flag):
         radar_str=f"{ts_str} {dd_val}cm",
         stats_str=f"{time_str[:5]} RX:{rx_counter} L:{lost_counter}",
     )
-    blink_rx_ok(led)
-    time.sleep(5)
+    # Критическое — мигаем + ждём кнопку
+    while True:
+        led.value(1); time.sleep_ms(200)
+        led.value(0); time.sleep_ms(200)
+        if flag.check() is not None:
+            break
 
 
 def _rx_display_status(msg, radio, oled, bat_monitor):
