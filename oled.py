@@ -62,6 +62,37 @@ class OLEDDisplay:
         if fill > 0:
             d.fill_rect(x + 2, y + 2, fill, 3, color) # charge fill
 
+    def _draw_person_icon(self, x, y, color=0):
+        """Person icon 7x9 for header."""
+        d = self.display
+        # Head (round)
+        d.hline(x + 2, y, 3, color)
+        d.hline(x + 1, y + 1, 5, color)
+        d.hline(x + 2, y + 2, 3, color)
+        # Body
+        d.vline(x + 3, y + 3, 3, color)
+        # Arms
+        d.hline(x, y + 4, 7, color)
+        # Legs
+        d.pixel(x + 1, y + 7, color)
+        d.pixel(x + 2, y + 6, color)
+        d.pixel(x + 4, y + 6, color)
+        d.pixel(x + 5, y + 7, color)
+
+    def _draw_car_icon(self, x, y, color=0):
+        """Car icon 11x7 for header."""
+        d = self.display
+        # Roof
+        d.hline(x + 2, y, 7, color)
+        # Windshield + body
+        d.hline(x + 1, y + 1, 9, color)
+        d.hline(x, y + 2, 11, color)
+        d.hline(x, y + 3, 11, color)
+        d.hline(x, y + 4, 11, color)
+        # Wheels
+        d.fill_rect(x + 1, y + 5, 3, 2, color)
+        d.fill_rect(x + 7, y + 5, 3, 2, color)
+
     def _draw_wifi_icon(self, x, y, color=0):
         """WiFi signal icon 7x7. Simplified arcs + dot."""
         d = self.display
@@ -189,30 +220,45 @@ class OLEDDisplay:
 
     def draw_header(self, title, bat1_pct=None, bat2_pct=None, wifi=False,
                     locked=None):
-        """Draw inverted header bar with optional status icons.
+        """Draw inverted header bar with person/car icons at batteries.
 
         Layout (128x13px, white background):
-        [TITLE]  [lock] [antenna] [wifi] [bat1 XX] [bat2 XX]
+        [TITLE]  [wifi] [icon1 bat1 XX] [icon2 bat2 XX]
         """
         if not self.display:
             return
         h_height = 13
         self.display.fill_rect(0, 0, OLED_WIDTH, h_height, 1)
-        self._text(title[:8], 2, 3, 0)
+        if title == "\x01":
+            # Heart icon instead of text
+            self._draw_heart_icon(3, 3, 0)
+        else:
+            self._text(title[:8], 2, 3, 0)
+
+        # Determine which icon goes with which battery
+        # bat2 = remote device, bat1 = local
+        is_car = (title == t("car"))
 
         rx = 126  # Right edge cursor (build icons right-to-left)
 
-        # Battery 2 (remote device)
+        # Battery 2 (remote device) + icon
         if bat2_pct is not None:
             pct_str = str(bat2_pct)
             tw = len(pct_str) * 8
             rx -= tw
             self.display.text(pct_str, rx, 3, 0)
-            rx -= 13  # battery icon width + gap
+            rx -= 13
             self._draw_mini_battery(rx, 3, bat2_pct, color=0)
-            rx -= 2  # gap
+            rx -= 1
+            if is_car:
+                rx -= 8
+                self._draw_person_icon(rx, 2, color=0)
+            else:
+                rx -= 12
+                self._draw_car_icon(rx, 3, color=0)
+            rx -= 1
 
-        # Battery 1 (local device)
+        # Battery 1 (local device) + icon
         if bat1_pct is not None:
             pct_str = str(bat1_pct)
             tw = len(pct_str) * 8
@@ -220,19 +266,20 @@ class OLEDDisplay:
             self.display.text(pct_str, rx, 3, 0)
             rx -= 13
             self._draw_mini_battery(rx, 3, bat1_pct, color=0)
-            rx -= 2
+            rx -= 1
+            if is_car:
+                rx -= 12
+                self._draw_car_icon(rx, 3, color=0)
+            else:
+                rx -= 8
+                self._draw_person_icon(rx, 2, color=0)
+            rx -= 1
 
         # WiFi icon
         if wifi:
             rx -= 8
             self._draw_wifi_icon(rx, 3, color=0)
             rx -= 2
-
-        # Lock icon — right after title, with 3px gap
-        if locked is not None:
-            lock_x = len(title[:8]) * 8 + 5
-            if lock_x + 9 <= rx:  # fits before batteries
-                self._draw_lock_header(lock_x, 1, locked)
 
     def _draw_lock_header(self, x, y, locked):
         """Lock for header 9x11 (inverted: color=0 on white bg)."""
@@ -386,7 +433,7 @@ class OLEDDisplay:
 
     def show_tx_armed(self, radar_state, distance, bat_pct, charging,
                       idle_s, idle_max, pkt, remote_bat=None,
-                      hb_countdown=None):
+                      hb_pct=0):
         """TX armed — table layout like rx_box."""
         if not self.display:
             return
@@ -420,15 +467,18 @@ class OLEDDisplay:
         dist_y = tbl_y + (tbl_h - 16) // 2
         self._draw_large_text(dist_x, dist_y, distance, color=1, scale=2)
 
-        # Bottom: pkt + heartbeat countdown
-        hb_s = f" HB:{hb_countdown}" if hb_countdown is not None else ""
-        idle_lbl = f"{t('pkt')}:{pkt}{hb_s}"
-        self._text(idle_lbl, 2, 55, 1)
+        # Bottom: heartbeat progress bar
+        bar_x, bar_y, bar_w, bar_h = 2, 54, OLED_WIDTH - 4, 8
+        d.rect(bar_x, bar_y, bar_w, bar_h, 1)
+        fill_w = int((bar_w - 4) * (hb_pct / 100.0))
+        if fill_w > 0:
+            d.fill_rect(bar_x + 2, bar_y + 2, fill_w, bar_h - 4, 1)
         d.show()
 
     def show_tx_disarmed(self, bat_pct, charging, pkt, remote_bat=None,
-                         hb_countdown=None):
-        """TX disarmed — table layout with lock icon."""
+                         hb_pct=0, date_str="", time_str="",
+                         rx_cnt=0, lost_cnt=0):
+        """TX disarmed — full table layout."""
         if not self.display:
             return
         d = self.display
@@ -437,29 +487,45 @@ class OLEDDisplay:
                          locked=False)
 
         tbl_y = 14
-        tbl_h = 38
         mid_x = 56
 
-        # Outer border + divider
-        d.rect(0, tbl_y, OLED_WIDTH, tbl_h, 1)
-        d.vline(mid_x, tbl_y, tbl_h, 1)
+        # Outer border
+        d.rect(0, tbl_y, OLED_WIDTH, 50, 1)
 
-        # Left: СНЯТО (inverted) full height
-        d.fill_rect(1, tbl_y + 1, mid_x - 1, tbl_h - 2, 1)
+        # ── Row 1 (18px): СНЯТО | date+time ──
+        row1_h = 18
+        d.vline(mid_x, tbl_y, row1_h + 1, 1)
+        d.hline(0, tbl_y + row1_h, OLED_WIDTH, 1)
+
+        # Left: СНЯТО inverted
+        d.fill_rect(1, tbl_y + 1, mid_x - 1, row1_h - 1, 1)
         ds = t("disarmed")
         dsx = (mid_x - len(ds) * 8) // 2
-        self._text(ds[:7], dsx, tbl_y + (tbl_h - 8) // 2, 0)
+        self._text(ds[:7], max(dsx, 2), tbl_y + 5, 0)
 
-        # Right: lock icon centered
-        self._draw_lock_icon(mid_x + (OLED_WIDTH - mid_x - 9) // 2,
-                             tbl_y + (tbl_h - 14) // 2,
-                             locked=False, color=1)
+        # Right: date + time (or dashes)
+        dt = date_str[:9] if date_str else "--.--.--"
+        tm = time_str[:8] if time_str else "--:--:--"
+        self._text(dt, mid_x + 3, tbl_y + 1, 1)
+        self._text(tm, mid_x + 3, tbl_y + 10, 1)
 
-        # Bottom: pkt + heartbeat countdown (battery in header)
-        hb_s = f" HB:{hb_countdown}" if hb_countdown is not None else ""
-        btm = f"{t('pkt')}:{pkt}{hb_s}"
-        bx = (OLED_WIDTH - len(btm) * 8) // 2
-        self._text(btm, bx, 55, 1)
+        # ── Row 2 (12px): pkt | rx/lost ──
+        row2_y = tbl_y + row1_h
+        row2_h = 12
+        d.vline(mid_x, row2_y, row2_h + 1, 1)
+        d.hline(0, row2_y + row2_h, OLED_WIDTH, 1)
+
+        self._text(f"{t('pkt')}:{pkt}", 3, row2_y + 2, 1)
+        self._text(f"{t('rx_lbl')}:{rx_cnt} {t('lost_lbl')}:{lost_cnt}", mid_x + 3, row2_y + 2, 1)
+
+        # ── Row 3 (18px): heartbeat progress bar (100→0) ──
+        bar_x, bar_y = 4, tbl_y + row1_h + row2_h + 4
+        bar_w, bar_h = OLED_WIDTH - 8, 10
+        d.rect(bar_x, bar_y, bar_w, bar_h, 1)
+        remaining = max(0, 100 - hb_pct)
+        fill_w = int((bar_w - 4) * (remaining / 100.0))
+        if fill_w > 0:
+            d.fill_rect(bar_x + 2, bar_y + 2, fill_w, bar_h - 4, 1)
         d.show()
 
     def show_rx_idle(self, bat_pct, charging, rx_cnt, lost_cnt, remote_bat=None,
@@ -485,7 +551,13 @@ class OLEDDisplay:
         d.vline(mid_x, tbl_y, row1_h + 1, 1)
         d.hline(0, tbl_y + row1_h, OLED_WIDTH, 1)
 
-        if locked is True:
+        if locked == "error":
+            # Error: inverted left cell
+            d.fill_rect(1, tbl_y + 1, mid_x - 1, row1_h - 1, 1)
+            er = t("no_rdr")
+            ex = (mid_x - len(er) * 8) // 2
+            self._text(er, max(ex, 2), tbl_y + 5, 0)
+        elif locked is True:
             # Armed: inverted left cell
             d.fill_rect(1, tbl_y + 1, mid_x - 1, row1_h - 1, 1)
             arm = t("armed")
@@ -532,20 +604,17 @@ class OLEDDisplay:
                 if (px + py) % 4 == 0:
                     d.pixel(px, py, 1)
 
-        # Progress bar
+        # Progress bar (full width, no percent label)
         pb_y = bar_section_y + 3
         pb_h = 12
         pb_x = 4
-        pb_w = 96
+        pb_w = OLED_WIDTH - 8
         d.fill_rect(pb_x - 1, pb_y - 1, pb_w + 2, pb_h + 2, 0)
         d.rect(pb_x, pb_y, pb_w, pb_h, 1)
-        fill_w = int((pb_w - 4) * (hb_pct / 100.0))
+        remaining = max(0, 100 - hb_pct)
+        fill_w = int((pb_w - 4) * (remaining / 100.0))
         if fill_w > 0:
             d.fill_rect(pb_x + 2, pb_y + 2, fill_w, pb_h - 4, 1)
-
-        # Percent right of bar
-        pct_str = f"{hb_pct}%"
-        d.text(pct_str, pb_x + pb_w + 4, pb_y + 2, 1)
 
         d.show()
 
@@ -691,8 +760,8 @@ class OLEDDisplay:
         self.display.text(bat_str, bx, 56, 1)
         self.display.show()
 
-    def show_sos_sent(self, bat_pct, remote_bat=None):
-        """SOS sent — bell icon centered + text below."""
+    def show_sos_sent(self, bat_pct, remote_bat=None, text=None):
+        """SOS sent/ack — bell icon centered + text below."""
         if not self.display:
             return
         d = self.display
@@ -723,8 +792,8 @@ class OLEDDisplay:
         # Handle on top
         d.fill_rect(cx - 1, 14, 2, 3, 1)
 
-        # "SOS ПОСЛАН!" centered below icon
-        sos = t("sos_sent")
+        # Text centered below icon
+        sos = text if text else t("sos_sent")
         sx = (OLED_WIDTH - len(sos) * 8) // 2
         self._text(sos, sx, 42, 1)
         self._text(sos, sx + 1, 42, 1)  # bold
